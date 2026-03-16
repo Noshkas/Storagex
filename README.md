@@ -24,6 +24,19 @@ Use it when you are comfortable with:
 - keeping local auth state on your own machine
 - YouTube being a third-party dependency that can fail or change
 
+## Current features
+
+- Encrypt supported files with a `24`-digit key before they leave the machine.
+- Upload encrypted archive videos into your own YouTube account.
+- Recover the original file later through the local download and decode flow.
+- Keep YouTube client credentials and OAuth login persisted across app restarts.
+- Organize the library with local-only folders stored in `data/library-index.json`.
+- Rename files inline inside the library without changing the archived payload on YouTube.
+- Delete files from StorageX and from YouTube so they stay gone after reload.
+- Delete folders locally while moving their files back into `All files`.
+- Keep the encryption key session-only in the browser instead of persisting it to disk.
+- Reuse the last known library on reload while the app refreshes live state in the background.
+
 ## Requirements
 
 - macOS or another machine that can run Python 3.13 and `ffmpeg`

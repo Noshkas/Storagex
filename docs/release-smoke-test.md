@@ -16,12 +16,14 @@ cd /path/to/storagex
 6. Confirm the file appears in the library.
 7. Create a folder, upload into it, then confirm the file appears in that folder.
 8. Double-click the file name, rename it inline, and confirm the new name stays visible.
-9. Reload the page and confirm the library stays visible while state refreshes.
-10. Download the file and confirm the recovered bytes match the source and the suggested filename uses the local rename.
-11. Try a wrong key and confirm the recovery finishes with failed integrity.
-12. Restart the app and confirm YouTube credentials and local folder organization reload, but the encryption key does not.
-13. Disconnect YouTube and confirm the app returns to the disconnected state.
-14. Use `Reset local YouTube setup` and confirm the saved local auth/config is wiped.
+9. Select a file, delete it, and confirm it disappears immediately and stays gone after reload.
+10. Delete a non-root folder and confirm its files move back to `All files`.
+11. Reload the page and confirm the library stays visible while state refreshes.
+12. Download a file and confirm the recovered bytes match the source and the suggested filename uses the local rename.
+13. Try a wrong key and confirm the recovery finishes with failed integrity.
+14. Restart the app and confirm YouTube credentials and local folder organization reload, but the encryption key does not.
+15. Disconnect YouTube and confirm the app returns to the disconnected state.
+16. Use `Reset local YouTube setup` and confirm the saved local auth/config is wiped.
 
 ## Error-path pass
 

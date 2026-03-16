@@ -19,6 +19,7 @@ from .codec.constants import DATA_DIR, FORMAT_VERSION
 YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly",
+    "https://www.googleapis.com/auth/youtube",
 ]
 METADATA_BLOCK_PATTERN = re.compile(r"\[storagex\](?P<body>.*?)\[/storagex\]", re.DOTALL)
 TITLE_PREFIX = "StorageX · "
@@ -40,11 +41,19 @@ class YouTubeAuthError(YouTubeError):
     pass
 
 
+class YouTubeSessionExpiredError(YouTubeAuthError):
+    pass
+
+
 class YouTubeUploadError(YouTubeError):
     pass
 
 
 class YouTubeDownloadError(YouTubeError):
+    pass
+
+
+class YouTubeDeleteError(YouTubeError):
     pass
 
 
@@ -247,21 +256,10 @@ class YouTubeService:
                 privacy_status=self.privacy_status,
             )
 
-        try:
-            channel_title, _uploads_playlist_id = self._channel_info()
-        except YouTubeAuthError:
-            self.disconnect()
-            return YouTubeSessionStatus(
-                configured=True,
-                connected=False,
-                channel_title=None,
-                privacy_status=self.privacy_status,
-            )
-
         return YouTubeSessionStatus(
             configured=True,
             connected=True,
-            channel_title=channel_title,
+            channel_title=None,
             privacy_status=self.privacy_status,
         )
 
@@ -286,6 +284,9 @@ class YouTubeService:
         normalized_client_secret = client_secret.strip()
         if not normalized_client_id or not normalized_client_secret:
             raise YouTubeConfigurationError("Client ID and client secret are required.")
+        current_client_id, current_client_secret = self._store.get_client_config()
+        if current_client_id == normalized_client_id and current_client_secret == normalized_client_secret:
+            return self.settings_snapshot()
         self._store.set_client_config(normalized_client_id, normalized_client_secret)
         return self.settings_snapshot()
 
@@ -508,6 +509,13 @@ class YouTubeService:
                 )
         raise YouTubeDownloadError("Could not download the YouTube video for recovery.")
 
+    def delete_video(self, video_id: str) -> None:
+        service = self._build_service()
+        try:
+            service.videos().delete(id=video_id).execute()
+        except Exception as exc:  # pragma: no cover - network/api failure
+            raise YouTubeDeleteError(self._delete_error_message(exc)) from exc
+
     @property
     def privacy_status(self) -> str:
         configured_value = os.environ.get("YOUTUBE_PRIVACY_STATUS", "private").strip().lower()
@@ -562,11 +570,11 @@ class YouTubeService:
                 self._store.set_credentials(credentials)
             except Exception as exc:  # pragma: no cover - token refresh failure
                 self.disconnect()
-                raise YouTubeAuthError("The saved YouTube session expired. Connect YouTube again.") from exc
+                raise YouTubeSessionExpiredError("The saved YouTube session expired. Connect YouTube again.") from exc
 
         if not credentials.valid:
             self.disconnect()
-            raise YouTubeAuthError("The saved YouTube session is no longer valid. Connect YouTube again.")
+            raise YouTubeSessionExpiredError("The saved YouTube session is no longer valid. Connect YouTube again.")
 
         return credentials
 
@@ -579,17 +587,17 @@ class YouTubeService:
         try:
             response = service.channels().list(part="snippet,contentDetails", mine=True).execute()
         except Exception as exc:  # pragma: no cover - network/api failure
-            raise YouTubeAuthError("Could not read the connected YouTube channel.") from exc
+            raise YouTubeError("Could not read the connected YouTube channel.") from exc
 
         items = response.get("items", [])
         if not items:
-            raise YouTubeAuthError("The connected Google account does not expose a YouTube channel.")
+            raise YouTubeError("The connected Google account does not expose a YouTube channel.")
 
         item = items[0]
         channel_title = str(item.get("snippet", {}).get("title", "YouTube"))
         uploads_playlist_id = str(item.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads", ""))
         if not uploads_playlist_id:
-            raise YouTubeAuthError("Could not find the YouTube uploads playlist for this channel.")
+            raise YouTubeError("Could not find the YouTube uploads playlist for this channel.")
         return channel_title, uploads_playlist_id
 
     def _record_from_video_item(
@@ -739,6 +747,15 @@ class YouTubeService:
         if "access_denied" in normalized:
             return "Google denied access to this app. Add your Google account as a test user, then connect again."
         return "Google did not return a valid YouTube authorization token."
+
+    @staticmethod
+    def _delete_error_message(exc: Exception) -> str:
+        normalized = YouTubeService._extract_google_error_text(exc).lower()
+        if "insufficientpermissions" in normalized or "insufficient authentication scopes" in normalized:
+            return "Reconnect YouTube to grant delete access for this app."
+        if "not found" in normalized or "videonotfound" in normalized:
+            return "File not found in your YouTube library."
+        return "Could not delete that YouTube video."
 
     @staticmethod
     def _extract_google_error_text(exc: Exception) -> str:

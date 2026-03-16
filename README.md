@@ -45,7 +45,8 @@ cd /path/to/storagex
 4. Paste your Google OAuth `Client ID` and `Client Secret`.
 5. Click `Connect` and finish the Google / YouTube sign-in flow.
 6. Upload a supported file.
-7. Use `Download` later to recover the original file.
+7. Organize files with local folders.
+8. Use `Download` later to recover the original file.
 
 ## Google OAuth setup
 
@@ -74,11 +75,20 @@ StorageX expects you to bring your own client credentials. It does not ship with
 - Local decode upload size limit: `250 MB`
 - Encryption key format: exactly `24` digits
 
+## Organization model
+
+- StorageX uses virtual folders stored only on this machine.
+- Folder names, file placement, and local file renames live in `data/library-index.json`.
+- Those organization changes do not modify YouTube metadata and are not synced across devices.
+- If the local index is removed or rebuilt, files fall back to their original uploaded filename in `All files`.
+- File renaming happens only inside the local library view and does not change the archived payload.
+
 ## Local state and privacy
 
 StorageX stores local runtime state in this folder:
 
 - `data/youtube-auth.json`
+- `data/library-index.json`
 
 That file can contain:
 
@@ -87,11 +97,20 @@ That file can contain:
 - your Google refresh token / access token state
 - pending OAuth PKCE state during sign-in
 
+The library index can contain:
+
+- your local folder tree
+- per-file folder assignment
+- per-file local display name override
+
 Behavior notes:
 
 - the file is local-only and written with `0600` permissions when possible
 - the UI encryption key is stored only in browser session storage if you save it there
+- restarting the app reloads saved YouTube credentials from disk, but does not reload the encryption key
 - local recovery may use browser cookies from Chrome or Safari when `yt-dlp` needs them to access your video
+
+More detail lives in [docs/local-state.md](docs/local-state.md).
 
 If you want to wipe local YouTube state, use `Settings` → `Reset local YouTube setup`.
 

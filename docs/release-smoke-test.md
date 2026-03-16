@@ -14,11 +14,14 @@ cd /path/to/storagex
 4. Connect the YouTube account.
 5. Upload one small `.txt` file.
 6. Confirm the file appears in the library.
-7. Reload the page and confirm the library stays visible while state refreshes.
-8. Download the file and confirm the recovered bytes match the source.
-9. Try a wrong key and confirm the recovery finishes with failed integrity.
-10. Disconnect YouTube and confirm the app returns to the disconnected state.
-11. Use `Reset local YouTube setup` and confirm the saved local auth/config is wiped.
+7. Create a folder, upload into it, then confirm the file appears in that folder.
+8. Double-click the file name, rename it inline, and confirm the new name stays visible.
+9. Reload the page and confirm the library stays visible while state refreshes.
+10. Download the file and confirm the recovered bytes match the source and the suggested filename uses the local rename.
+11. Try a wrong key and confirm the recovery finishes with failed integrity.
+12. Restart the app and confirm YouTube credentials and local folder organization reload, but the encryption key does not.
+13. Disconnect YouTube and confirm the app returns to the disconnected state.
+14. Use `Reset local YouTube setup` and confirm the saved local auth/config is wiped.
 
 ## Error-path pass
 

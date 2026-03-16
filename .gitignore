@@ -6,3 +6,4 @@ __pycache__/
 data/jobs/*
 !data/jobs/.gitkeep
 data/youtube-auth.json
+data/library-index.json

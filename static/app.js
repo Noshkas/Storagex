@@ -1,17 +1,34 @@
 const KEY_STORAGE_KEY = "sx_key";
-const LIBRARY_CACHE_KEY = "sx_library_cache_v1";
+const LIBRARY_CACHE_KEY = "sx_library_cache_v2";
+const VIEW_STATE_KEY = "sx_library_view_v1";
+const FOLDER_COLORS_KEY = "sx_folder_colors";
 const KEY_PATTERN = /^\d{24}$/;
 const POLL_INTERVAL_MS = 1000;
 const CONNECT_URL = "/auth/youtube/start";
+const ROOT_FOLDER_ID = "root";
 const FLASH_DISMISS_MS = 4200;
+
+const FOLDER_COLORS = [
+  { id: "rose",   bg: "#fde8e8", border: "#f0b8b8" },
+  { id: "coral",  bg: "#fee8e0", border: "#f5a888" },
+  { id: "amber",  bg: "#fef3e0", border: "#f5cc80" },
+  { id: "lime",   bg: "#eaf5e8", border: "#a8d8a4" },
+  { id: "mint",   bg: "#e0f8ec", border: "#80d4a8" },
+  { id: "teal",   bg: "#e0f5f2", border: "#88d8ce" },
+  { id: "sky",    bg: "#e0eeff", border: "#90bcf5" },
+  { id: "iris",   bg: "#ece8ff", border: "#b4a4f0" },
+  { id: "pink",   bg: "#fde8f5", border: "#f0a8d8" },
+];
 
 const state = {
   busy: false,
   library: {
     configured: false,
     connected: false,
-    files: [],
     connect_url: CONNECT_URL,
+    files: [],
+    folders: [{ id: ROOT_FOLDER_ID, name: "All files", parent_id: null }],
+    index_recovered: false,
   },
   settings: {
     configured: false,
@@ -19,11 +36,21 @@ const state = {
     has_client_secret: false,
     source: "none",
   },
+  currentFolderId: ROOT_FOLDER_ID,
+  selectedVideoId: "",
+  editingVideoId: "",
   keyResolver: null,
-  settingsOpen: false,
+  confirmResolver: null,
   previousFocus: null,
+  confirmPreviousFocus: null,
+  settingsOpen: false,
+  organizationOpen: false,
+  confirmOpen: false,
+  organizationAction: null,
   flashTimer: null,
-  renderedLibrarySignature: "",
+  renamePending: false,
+  folderDropdownOpen: false,
+  newFolderColorId: FOLDER_COLORS[0].id,
 };
 
 const dataTable = document.querySelector("#data-table");
@@ -45,17 +72,43 @@ const settingsClose = document.querySelector("#settings-close");
 const settingsCancel = document.querySelector("#settings-cancel");
 const disconnectButton = document.querySelector("#disconnect-button");
 const resetButton = document.querySelector("#reset-button");
+const folderDropdown = document.querySelector("#folder-dropdown");
+const folderDropdownBtn = document.querySelector("#folder-dropdown-btn");
+const folderDropdownLabel = document.querySelector("#folder-dropdown-label");
+const folderDropdownPanel = document.querySelector("#folder-dropdown-panel");
+const folderColorField = document.querySelector("#folder-color-field");
+const folderColorPicker = document.querySelector("#folder-color-picker");
+const newFolderButton = document.querySelector("#new-folder-button");
+const deleteFolderButton = document.querySelector("#delete-folder-button");
 const flashMessage = document.querySelector("#flash-message");
 const jobPanel = document.querySelector("#job-panel");
 const jobTitle = document.querySelector("#job-title");
 const jobProgressLabel = document.querySelector("#job-progress-label");
 const jobProgressValue = document.querySelector("#job-progress-value");
+const organizeModal = document.querySelector("#organize-modal");
+const organizeBackdrop = organizeModal.querySelector(".modal__backdrop");
+const organizeForm = document.querySelector("#organize-form");
+const organizeTitle = document.querySelector("#organize-title");
+const organizeClose = document.querySelector("#organize-close");
+const organizeCancel = document.querySelector("#organize-cancel");
+const organizeSubmit = document.querySelector("#organize-submit");
+const organizeNameField = document.querySelector("#organize-name-field");
+const organizeNameLabel = document.querySelector("#organize-name-label");
+const organizeName = document.querySelector("#organize-name");
+const organizeError = document.querySelector("#organize-error");
 const keyModal = document.querySelector("#key-modal");
 const keyBackdrop = keyModal.querySelector(".modal__backdrop");
 const keyForm = document.querySelector("#key-form");
 const keyInput = document.querySelector("#key-input");
 const keyError = document.querySelector("#key-error");
 const keyCancel = document.querySelector("#key-cancel");
+const confirmModal = document.querySelector("#confirm-modal");
+const confirmBackdrop = confirmModal.querySelector(".modal__backdrop");
+const confirmTitle = document.querySelector("#confirm-title");
+const confirmMessage = document.querySelector("#confirm-message");
+const confirmClose = document.querySelector("#confirm-close");
+const confirmCancel = document.querySelector("#confirm-cancel");
+const confirmSubmit = document.querySelector("#confirm-submit");
 
 settingsButton.addEventListener("click", openSettingsModal);
 settingsForm.addEventListener("submit", submitSettings);
@@ -72,7 +125,21 @@ settingsKey.addEventListener("input", () => {
 });
 uploadButton.addEventListener("click", handlePrimaryAction);
 uploadInput.addEventListener("change", () => handleFileSelection(uploadInput.files?.[0]));
-filesList.addEventListener("click", handleFileAction);
+folderDropdownBtn.addEventListener("click", toggleFolderDropdown);
+folderDropdownPanel.addEventListener("click", handleFolderOptionClick);
+folderColorPicker.addEventListener("click", handleColorSwatchClick);
+document.addEventListener("click", handleOutsideClick);
+filesList.addEventListener("click", handleFilesListClick);
+filesList.addEventListener("dblclick", handleFilesListDoubleClick);
+filesList.addEventListener("keydown", handleFilesListKeydown);
+filesList.addEventListener("focusout", handleFilesListFocusOut);
+newFolderButton.addEventListener("click", () => openOrganizationModal({ type: "create-folder" }));
+deleteFolderButton.addEventListener("click", handleDeleteFolder);
+organizeForm.addEventListener("submit", submitOrganizationAction);
+organizeClose.addEventListener("click", closeOrganizationModal);
+organizeCancel.addEventListener("click", closeOrganizationModal);
+organizeBackdrop.addEventListener("click", closeOrganizationModal);
+organizeName.addEventListener("input", hideOrganizationError);
 keyForm.addEventListener("submit", submitKeyPrompt);
 keyCancel.addEventListener("click", () => resolveKeyPrompt(null));
 keyBackdrop.addEventListener("click", () => resolveKeyPrompt(null));
@@ -80,24 +147,16 @@ keyInput.addEventListener("input", () => {
   keyInput.value = keyInput.value.replace(/\D/g, "").slice(0, 24);
   hideKeyError();
 });
-document.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape") {
-    return;
-  }
-  if (!settingsModal.hidden) {
-    event.preventDefault();
-    closeSettingsModal();
-    return;
-  }
-  if (!keyModal.hidden) {
-    event.preventDefault();
-    resolveKeyPrompt(null);
-  }
-});
+confirmClose.addEventListener("click", () => resolveConfirm(false));
+confirmCancel.addEventListener("click", () => resolveConfirm(false));
+confirmBackdrop.addEventListener("click", () => resolveConfirm(false));
+confirmSubmit.addEventListener("click", () => resolveConfirm(true));
+document.addEventListener("keydown", handleGlobalKeydown);
 
 void bootstrap();
 
 async function bootstrap() {
+  hydrateViewState();
   renderPrimaryAction();
   renderSettingsActions();
   showFlashFromQuery();
@@ -123,7 +182,8 @@ async function refreshSettings() {
 
 async function refreshLibrary(options = {}) {
   const payload = await fetchJson("/api/library", undefined, "Could not load files.");
-  const fetchedFiles = Array.isArray(payload.files) ? payload.files.slice() : [];
+  const fetchedFolders = normalizeFolders(payload.folders);
+  const fetchedFiles = normalizeFiles(payload.files, fetchedFolders);
   const preserveExistingFiles = Boolean(
     options.preserveExistingFiles !== false &&
     fetchedFiles.length === 0 &&
@@ -132,37 +192,52 @@ async function refreshLibrary(options = {}) {
   );
   const files = preserveExistingFiles ? state.library.files.slice() : fetchedFiles;
 
-  if (options.fallbackFile && !files.some((item) => item.video_id === options.fallbackFile.video_id)) {
-    files.unshift(options.fallbackFile);
+  if (options.fallbackFile && !files.some((file) => file.video_id === options.fallbackFile.video_id)) {
+    files.unshift(normalizeFile(options.fallbackFile, fetchedFolders));
   }
 
-  const nextLibrary = {
+  state.library = {
     configured: Boolean(payload.configured),
     connected: Boolean(payload.connected),
     connect_url: payload.connect_url || CONNECT_URL,
     files,
+    folders: fetchedFolders,
+    index_recovered: Boolean(payload.index_recovered),
   };
 
-  state.library = nextLibrary;
-  syncLibraryCache(nextLibrary, {
+  normalizeViewState();
+  syncLibraryCache(state.library, {
     preserveExistingFiles,
     clear: Boolean(options.clearCache),
   });
-
-  renderLibrary(payload.error || null);
+  renderLibraryState(payload.error || null);
 }
 
-function renderLibrary(libraryError) {
+function renderLibraryState(libraryError = null) {
   renderPrimaryAction();
   renderSettingsActions();
 
   if (libraryError) {
     setFlash("error", libraryError, "library");
+    clearFlash("index");
   } else {
     clearFlash("library");
+    if (state.library.index_recovered) {
+      setFlash("error", "Rebuilt the local folder index.", "index");
+    } else {
+      clearFlash("index");
+    }
   }
 
+  renderViews();
+}
+
+function renderViews() {
+  normalizeViewState();
+  renderFolderSelect();
+  renderFolderActions();
   renderFiles();
+  persistViewState();
 }
 
 function renderPrimaryAction() {
@@ -182,54 +257,249 @@ function renderSettingsActions() {
   }
 }
 
-function renderFiles() {
-  const signature = buildLibrarySignature(state.library);
-  if (signature === state.renderedLibrarySignature) {
+function renderFolderActions() {
+  const isRoot = state.currentFolderId === ROOT_FOLDER_ID;
+  deleteFolderButton.disabled = isRoot;
+  deleteFolderButton.setAttribute("aria-disabled", isRoot ? "true" : "false");
+}
+
+function renderFolderSelect() {
+  const currentFolder = getCurrentFolder();
+  const color = getFolderColor(state.currentFolderId);
+
+  folderDropdownLabel.textContent = currentFolder?.name || "All files";
+  folderDropdownBtn.style.background = color ? color.bg : "";
+  folderDropdownBtn.style.borderColor = color ? color.border : "";
+
+  applyFolderTheme(color);
+
+  const childMap = buildFolderChildMap();
+  const rootFolder = getFolderById(ROOT_FOLDER_ID);
+  folderDropdownPanel.innerHTML = rootFolder ? renderFolderDropdownOptions(rootFolder, -1, childMap) : "";
+}
+
+function renderFolderDropdownOptions(folder, depth, childMap) {
+  const isActive = folder.id === state.currentFolderId;
+  const color = getFolderColor(folder.id);
+  const dotStyle = color
+    ? `background:${color.bg};border-color:${color.border}`
+    : `background:var(--surface-2);border-color:var(--border)`;
+  const indent = depth > 0 ? `style="padding-left:${10 + depth * 14}px"` : "";
+
+  let markup = `
+    <button class="folder-option${isActive ? " is-active" : ""}" type="button"
+      role="option" aria-selected="${isActive}" data-folder-id="${escapeHtml(folder.id)}" ${indent}>
+      <span class="folder-option__dot" style="${dotStyle}"></span>
+      <span class="folder-option__name">${escapeHtml(folder.name)}</span>
+    </button>`;
+
+  for (const child of childMap.get(folder.id) || []) {
+    markup += renderFolderDropdownOptions(child, depth + 1, childMap);
+  }
+  return markup;
+}
+
+function applyFolderTheme(color) {
+  const headEl = document.querySelector(".data-table__head");
+  if (!headEl) return;
+  headEl.style.background = color ? color.bg : "";
+  headEl.style.borderBottomColor = color ? color.border : "";
+}
+
+function toggleFolderDropdown() {
+  state.folderDropdownOpen ? closeFolderDropdown() : openFolderDropdown();
+}
+
+function openFolderDropdown() {
+  state.folderDropdownOpen = true;
+  folderDropdownPanel.hidden = false;
+  folderDropdownBtn.setAttribute("aria-expanded", "true");
+}
+
+function closeFolderDropdown() {
+  state.folderDropdownOpen = false;
+  folderDropdownPanel.hidden = true;
+  folderDropdownBtn.setAttribute("aria-expanded", "false");
+}
+
+function handleFolderOptionClick(event) {
+  const target = event.target instanceof Element ? event.target.closest("[data-folder-id]") : null;
+  if (!target) return;
+
+  const folderId = target.dataset.folderId || ROOT_FOLDER_ID;
+  closeFolderDropdown();
+  if (folderId === state.currentFolderId) return;
+
+  state.currentFolderId = folderId;
+  state.editingVideoId = "";
+  renderViews();
+}
+
+function handleOutsideClick(event) {
+  if (!state.folderDropdownOpen) return;
+  if (folderDropdown.contains(event.target)) return;
+  closeFolderDropdown();
+}
+
+function getFolderColorId(folderId) {
+  if (!folderId || folderId === ROOT_FOLDER_ID) return null;
+  try {
+    const raw = localStorage.getItem(FOLDER_COLORS_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw)[folderId] || null;
+  } catch { return null; }
+}
+
+function setFolderColorId(folderId, colorId) {
+  if (!folderId || folderId === ROOT_FOLDER_ID) return;
+  try {
+    const raw = localStorage.getItem(FOLDER_COLORS_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    if (colorId) { map[folderId] = colorId; } else { delete map[folderId]; }
+    localStorage.setItem(FOLDER_COLORS_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+function removeFolderColors(folderIds) {
+  if (!Array.isArray(folderIds) || folderIds.length === 0) return;
+  try {
+    const raw = localStorage.getItem(FOLDER_COLORS_KEY);
+    if (!raw) return;
+    const map = JSON.parse(raw);
+    for (const folderId of folderIds) {
+      delete map[folderId];
+    }
+    localStorage.setItem(FOLDER_COLORS_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+function getFolderColor(folderId) {
+  const colorId = getFolderColorId(folderId);
+  return colorId ? (FOLDER_COLORS.find((c) => c.id === colorId) || null) : null;
+}
+
+function handleColorSwatchClick(event) {
+  const swatch = event.target instanceof Element ? event.target.closest("[data-color]") : null;
+  if (!swatch) return;
+  state.newFolderColorId = swatch.dataset.color;
+  updateColorPickerUI();
+}
+
+async function handleDeleteFolder() {
+  if (state.currentFolderId === ROOT_FOLDER_ID || state.busy) {
     return;
   }
 
-  state.renderedLibrarySignature = signature;
+  const currentFolder = getCurrentFolder();
+  if (!currentFolder) {
+    return;
+  }
 
-  if (state.library.files.length === 0) {
+  const confirmed = await promptConfirm({
+    title: "Delete folder",
+    message: `Delete "${currentFolder.name}" and move its files to All files?`,
+    confirmLabel: "Delete",
+    destructive: true,
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const payload = await fetchJson(
+      `/api/library/folders/${encodeURIComponent(currentFolder.id)}`,
+      {
+        method: "DELETE",
+      },
+      "Could not delete folder.",
+    );
+    removeFolderColors(payload.result?.deleted_folder_ids || [currentFolder.id]);
+    state.currentFolderId = ROOT_FOLDER_ID;
+    closeFolderDropdown();
+    setFlash("success", "Folder deleted");
+    await refreshLibrary();
+  } catch (error) {
+    setFlash("error", error.message || "Could not delete folder.");
+  }
+}
+
+function updateColorPickerUI() {
+  for (const swatch of folderColorPicker.querySelectorAll("[data-color]")) {
+    swatch.classList.toggle("is-selected", swatch.dataset.color === state.newFolderColorId);
+  }
+}
+
+function renderFiles() {
+  const visibleFiles = getVisibleFiles();
+
+  if (visibleFiles.length === 0) {
     dataTable.hidden = true;
     filesList.innerHTML = "";
     emptyState.hidden = false;
 
-    if (!state.library.configured) {
-      emptyTitle.textContent = "No settings";
-    } else if (!state.library.connected) {
-      emptyTitle.textContent = "Not connected";
-    } else {
+    if (state.library.files.length === 0) {
+      if (!state.library.configured) {
+        emptyTitle.textContent = "No settings";
+      } else if (!state.library.connected) {
+        emptyTitle.textContent = "Not connected";
+      } else {
+        emptyTitle.textContent = "No files";
+      }
+    } else if (state.currentFolderId === ROOT_FOLDER_ID) {
       emptyTitle.textContent = "No files";
+    } else {
+      emptyTitle.textContent = "No files here";
     }
     return;
   }
 
   dataTable.hidden = false;
   emptyState.hidden = true;
-  filesList.innerHTML = state.library.files.map((file) => renderFileRow(file)).join("");
+  filesList.innerHTML = visibleFiles.map((file) => renderFileRow(file)).join("");
 }
 
 function renderFileRow(file) {
-  const name = file?.original_filename || "";
+  const rawName = file?.original_filename || "";
+  const shownName = file?.display_name || rawName;
+  const isEditing = file.video_id === state.editingVideoId;
+  const isSelected = file.video_id === state.selectedVideoId;
+  const renameValue = file.display_name_override || rawName;
+  const actionLabel = isSelected ? "Delete" : "Download";
+  const actionType = isSelected ? "delete" : "download";
+  const actionClassName = isSelected ? "file-link file-link--danger" : "file-link";
+  const actionIcon = isSelected ? deleteIconMarkup() : downloadIconMarkup();
   return `
-    <article class="file-row">
+    <article class="file-row${isSelected ? " is-selected" : ""}" data-video-id="${escapeHtml(file.video_id)}">
       <div class="file-cell">
-        <div class="file-name" title="${escapeHtml(name)}">${escapeHtml(displayName(name))}</div>
+        ${
+          isEditing
+            ? `
+              <input
+                class="file-name-input"
+                type="text"
+                value="${escapeHtml(renameValue)}"
+                data-action="rename-input"
+                data-video-id="${escapeHtml(file.video_id)}"
+                spellcheck="false"
+                autocomplete="off"
+              />
+            `
+            : `<div class="file-name" title="${escapeHtml(rawName)}">${escapeHtml(displayName(shownName))}</div>`
+        }
       </div>
       <div class="file-value">${escapeHtml(fileTypeLabel(file))}</div>
       <div class="file-value">${escapeHtml(formatBytes(file.original_size))}</div>
       <div class="file-value">${escapeHtml(formatDate(file.uploaded_at))}</div>
       <div class="file-download-cell">
         <button
-          class="file-link"
+          class="${actionClassName}"
           type="button"
-          title="Download"
-          aria-label="Download"
-          data-action="download"
+          title="${actionLabel}"
+          aria-label="${actionLabel}"
+          data-action="${actionType}"
           data-video-id="${escapeHtml(file.video_id)}"
         >
-          ${downloadIconMarkup()}
+          ${actionIcon}
         </button>
       </div>
     </article>
@@ -245,6 +515,152 @@ function displayName(filename) {
     .trim();
   const extension = match?.[2] || "";
   return `${base}${extension}`;
+}
+
+
+function handleFilesListClick(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target) {
+    return;
+  }
+
+  const actionTarget = target.closest("[data-action='download'], [data-action='delete']");
+  if (actionTarget instanceof HTMLElement) {
+    if (state.busy) {
+      return;
+    }
+
+    const videoId = actionTarget.dataset.videoId || "";
+    if (!videoId) {
+      setFlash("error", "Missing YouTube file id.");
+      return;
+    }
+
+    if (actionTarget.dataset.action === "delete") {
+      void handleDeleteFile(videoId);
+      return;
+    }
+
+    void handleRemoteDownload(videoId);
+    return;
+  }
+
+  if (target.closest("[data-action='rename-input']") || state.renamePending) {
+    return;
+  }
+
+  const row = target.closest(".file-row");
+  if (!(row instanceof HTMLElement)) {
+    return;
+  }
+
+  const videoId = row.dataset.videoId || "";
+  if (!videoId) {
+    return;
+  }
+
+  if (state.editingVideoId && state.editingVideoId !== videoId) {
+    return;
+  }
+
+  state.selectedVideoId = state.selectedVideoId === videoId ? "" : videoId;
+  renderFiles();
+}
+
+function handleFilesListDoubleClick(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target) {
+    return;
+  }
+
+  if (target.closest("[data-action='download']") || target.closest("[data-action='delete']") || target.closest("[data-action='rename-input']")) {
+    return;
+  }
+
+  const row = target.closest(".file-row");
+  if (!(row instanceof HTMLElement)) {
+    return;
+  }
+
+  const videoId = row.dataset.videoId || "";
+  if (!videoId) {
+    return;
+  }
+
+  startInlineRename(videoId);
+}
+
+function handleFilesListKeydown(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || target.dataset.action !== "rename-input") {
+    return;
+  }
+
+  if (event.key === "Enter") {
+    event.preventDefault();
+    void submitInlineRename(target.dataset.videoId || "", target.value);
+    return;
+  }
+
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelInlineRename();
+  }
+}
+
+function handleFilesListFocusOut(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || target.dataset.action !== "rename-input") {
+    return;
+  }
+
+  window.setTimeout(() => {
+    if (state.editingVideoId !== (target.dataset.videoId || "")) {
+      return;
+    }
+    void submitInlineRename(target.dataset.videoId || "", target.value);
+  }, 0);
+}
+
+function handleGlobalKeydown(event) {
+  if (event.key !== "Escape") {
+    return;
+  }
+
+  if (!confirmModal.hidden) {
+    event.preventDefault();
+    resolveConfirm(false);
+    return;
+  }
+
+  if (state.folderDropdownOpen) {
+    event.preventDefault();
+    closeFolderDropdown();
+    return;
+  }
+
+  if (!keyModal.hidden) {
+    event.preventDefault();
+    resolveKeyPrompt(null);
+    return;
+  }
+
+  if (state.editingVideoId) {
+    event.preventDefault();
+    cancelInlineRename();
+    return;
+  }
+
+  if (!organizeModal.hidden) {
+    event.preventDefault();
+    closeOrganizationModal();
+    return;
+  }
+
+  if (!settingsModal.hidden) {
+    event.preventDefault();
+    closeSettingsModal();
+  }
 }
 
 function handlePrimaryAction(event) {
@@ -265,26 +681,6 @@ function handlePrimaryAction(event) {
   }
 
   window.location.assign(state.library.connect_url || CONNECT_URL);
-}
-
-function handleFileAction(event) {
-  const target = event.target instanceof HTMLElement ? event.target.closest("[data-action]") : null;
-  if (!(target instanceof HTMLElement)) {
-    return;
-  }
-
-  const action = target.dataset.action;
-  if (action !== "download" || state.busy) {
-    return;
-  }
-
-  const videoId = target.dataset.videoId || "";
-  if (!videoId) {
-    setFlash("error", "Missing YouTube file id.");
-    return;
-  }
-
-  void handleRemoteDownload(videoId);
 }
 
 async function handleFileSelection(file) {
@@ -350,12 +746,10 @@ async function handleRemoteDownload(videoId) {
     key = "";
     const jobId = await jobIdPromise;
     const job = await pollJob(jobId);
+    const downloadName = job.metadata?.display_filename || job.metadata?.original_filename || "recovered.bin";
     setJobProgress(100, "Done");
-    await startBrowserDownload(
-      job.artifacts.recovered_file,
-      job.metadata?.original_filename || "recovered.bin",
-    );
-    setFlash("success", job.metadata?.original_filename || "Download complete");
+    await startBrowserDownload(job.artifacts.recovered_file, downloadName);
+    setFlash("success", downloadName);
     window.setTimeout(hideJobProgress, 1000);
   } catch (error) {
     hideJobProgress();
@@ -367,15 +761,60 @@ async function handleRemoteDownload(videoId) {
   }
 }
 
+async function handleDeleteFile(videoId) {
+  const file = state.library.files.find((item) => item.video_id === videoId);
+  if (!file || state.busy) {
+    return;
+  }
+
+  const confirmed = await promptConfirm({
+    title: "Delete file",
+    message: `Delete "${file.display_name || file.original_filename}" from StorageX and YouTube?`,
+    confirmLabel: "Delete",
+    destructive: true,
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  state.busy = true;
+  renderPrimaryAction();
+  clearFlash();
+
+  try {
+    await fetchJson(
+      `/api/library/files/${encodeURIComponent(videoId)}`,
+      {
+        method: "DELETE",
+      },
+      "Could not delete file.",
+    );
+    state.selectedVideoId = "";
+    state.editingVideoId = "";
+    setFlash("success", "File deleted");
+    await refreshLibrary();
+  } catch (error) {
+    setFlash("error", error.message || "Could not delete file.");
+  } finally {
+    state.busy = false;
+    renderPrimaryAction();
+  }
+}
+
 async function startUpload(file, key) {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("key", key);
+  formData.append("folder_id", state.currentFolderId || ROOT_FOLDER_ID);
 
-  const payload = await fetchJson("/api/files", {
-    method: "POST",
-    body: formData,
-  }, "Upload failed.");
+  const payload = await fetchJson(
+    "/api/files",
+    {
+      method: "POST",
+      body: formData,
+    },
+    "Upload failed.",
+  );
 
   return payload.job_id;
 }
@@ -384,10 +823,14 @@ async function startRemoteDownload(videoId, key) {
   const formData = new FormData();
   formData.append("key", key);
 
-  const payload = await fetchJson(`/api/files/${encodeURIComponent(videoId)}/download`, {
-    method: "POST",
-    body: formData,
-  }, "Download failed.");
+  const payload = await fetchJson(
+    `/api/files/${encodeURIComponent(videoId)}/download`,
+    {
+      method: "POST",
+      body: formData,
+    },
+    "Download failed.",
+  );
 
   return payload.job_id;
 }
@@ -395,7 +838,6 @@ async function startRemoteDownload(videoId, key) {
 async function pollJob(jobId) {
   while (true) {
     const payload = await fetchJson(`/api/jobs/${jobId}`, undefined, "Could not fetch job status.");
-
     setJobProgress(payload.progress, payload.message);
 
     if (payload.status === "completed") {
@@ -421,7 +863,12 @@ async function disconnectYouTube() {
 }
 
 async function resetYouTubeSetup() {
-  const confirmed = window.confirm("Reset the saved YouTube client config and local login on this Mac?");
+  const confirmed = await promptConfirm({
+    title: "Reset local YouTube setup",
+    message: "Reset the saved YouTube client config and local login on this Mac?",
+    confirmLabel: "Reset",
+    destructive: true,
+  });
   if (!confirmed) {
     return;
   }
@@ -454,21 +901,16 @@ function openSettingsModal() {
   settingsClientSecret.placeholder = state.settings.has_client_secret ? "Saved" : "";
   renderSettingsActions();
   hideSettingsError();
-
   window.setTimeout(() => settingsKey.focus(), 20);
 }
 
 function closeSettingsModal() {
   state.settingsOpen = false;
   settingsModal.hidden = true;
-  document.body.classList.remove("is-modal-open");
   settingsClientSecret.value = "";
   hideSettingsError();
-
-  if (state.previousFocus) {
-    state.previousFocus.focus();
-  }
-  state.previousFocus = null;
+  syncBodyModalState();
+  restorePreviousFocus();
 }
 
 async function submitSettings(event) {
@@ -492,16 +934,20 @@ async function submitSettings(event) {
     }
 
     try {
-      const payload = await fetchJson("/api/settings/youtube", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+      const payload = await fetchJson(
+        "/api/settings/youtube",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            client_id: clientId,
+            client_secret: clientSecret,
+          }),
         },
-        body: JSON.stringify({
-          client_id: clientId,
-          client_secret: clientSecret,
-        }),
-      }, "Could not save settings.");
+        "Could not save settings.",
+      );
 
       state.settings = {
         configured: Boolean(payload.configured),
@@ -532,6 +978,192 @@ async function submitSettings(event) {
   }
 }
 
+function startInlineRename(videoId) {
+  if (state.busy || state.renamePending) {
+    return;
+  }
+
+  const file = state.library.files.find((item) => item.video_id === videoId);
+  if (!file) {
+    return;
+  }
+
+  state.editingVideoId = videoId;
+  state.selectedVideoId = videoId;
+  renderFiles();
+  window.setTimeout(() => {
+    const input = filesList.querySelector(`[data-action="rename-input"][data-video-id="${CSS.escape(videoId)}"]`);
+    if (input instanceof HTMLInputElement) {
+      input.focus();
+      input.select();
+    }
+  }, 20);
+}
+
+function cancelInlineRename() {
+  if (!state.editingVideoId) {
+    return;
+  }
+
+  state.editingVideoId = "";
+  renderFiles();
+}
+
+async function submitInlineRename(videoId, nextValue) {
+  if (!videoId || state.editingVideoId !== videoId || state.renamePending) {
+    return;
+  }
+
+  const file = state.library.files.find((item) => item.video_id === videoId);
+  if (!file) {
+    cancelInlineRename();
+    return;
+  }
+
+  const trimmedName = String(nextValue || "").trim();
+  if (!trimmedName) {
+    cancelInlineRename();
+    return;
+  }
+
+  const currentName = file.display_name_override || file.original_filename;
+  if (trimmedName === currentName) {
+    cancelInlineRename();
+    return;
+  }
+
+  const payload = {
+    display_name: trimmedName === file.original_filename ? null : trimmedName,
+  };
+
+  try {
+    state.renamePending = true;
+    const response = await fetchJson(
+      `/api/library/files/${encodeURIComponent(videoId)}`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      },
+      "Could not rename file.",
+    );
+
+    const entry = response.file || {};
+    const override = typeof entry.display_name === "string" && entry.display_name.trim() ? entry.display_name.trim() : null;
+    file.display_name_override = override;
+    file.display_name = override || file.original_filename;
+    state.editingVideoId = "";
+    state.renamePending = false;
+    syncLibraryCache(state.library);
+    renderFiles();
+  } catch (error) {
+    state.renamePending = false;
+    setFlash("error", error.message || "Could not rename file.");
+    window.setTimeout(() => {
+      const input = filesList.querySelector(`[data-action="rename-input"][data-video-id="${CSS.escape(videoId)}"]`);
+      if (input instanceof HTMLInputElement) {
+        input.focus();
+        input.select();
+      }
+    }, 20);
+  }
+}
+
+function openOrganizationModal(action) {
+  if (!action) {
+    return;
+  }
+
+  if (action.type !== "create-folder") {
+    return;
+  }
+
+  state.previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  state.organizationAction = action;
+  state.organizationOpen = true;
+  organizeModal.hidden = false;
+  document.body.classList.add("is-modal-open");
+  hideOrganizationError();
+
+  organizeName.value = "";
+  organizeTitle.textContent = "New folder";
+  organizeNameLabel.textContent = "Folder name";
+  organizeSubmit.textContent = "Create";
+  organizeNameField.hidden = false;
+  folderColorField.hidden = false;
+  state.newFolderColorId = FOLDER_COLORS[0].id;
+  updateColorPickerUI();
+  window.setTimeout(() => organizeName.focus(), 20);
+}
+
+function closeOrganizationModal() {
+  state.organizationOpen = false;
+  state.organizationAction = null;
+  organizeModal.hidden = true;
+  organizeName.value = "";
+  folderColorField.hidden = true;
+  hideOrganizationError();
+  syncBodyModalState();
+  restorePreviousFocus();
+}
+
+async function submitOrganizationAction(event) {
+  event.preventDefault();
+  const action = state.organizationAction;
+  if (!action) {
+    return;
+  }
+
+  try {
+    if (action.type === "create-folder") {
+      const name = organizeName.value.trim();
+      if (!name) {
+        showOrganizationError("Folder name is required.");
+        return;
+      }
+      const response = await createFolderRequest(name, state.currentFolderId);
+      const newFolderId = response?.folder?.id;
+      if (newFolderId && state.newFolderColorId) {
+        setFolderColorId(newFolderId, state.newFolderColorId);
+      }
+      closeOrganizationModal();
+      setFlash("success", "Folder created");
+      await refreshLibrary();
+      return;
+    }
+  } catch (error) {
+    showOrganizationError(error.message || "Could not save changes.");
+  }
+}
+
+async function createFolderRequest(name, parentId, allowRetry = true) {
+  try {
+    return await fetchJson(
+      "/api/library/folders",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name,
+          parent_id: parentId || ROOT_FOLDER_ID,
+        }),
+      },
+      "Could not create folder.",
+    );
+  } catch (error) {
+    if (allowRetry && error instanceof Error && error.message === "Folder not found.") {
+      await refreshLibrary();
+      const fallbackParentId = getCurrentFolder()?.id || ROOT_FOLDER_ID;
+      return createFolderRequest(name, fallbackParentId, false);
+    }
+    throw error;
+  }
+}
+
 function showSettingsError(message) {
   settingsError.hidden = false;
   settingsError.textContent = message;
@@ -540,6 +1172,16 @@ function showSettingsError(message) {
 function hideSettingsError() {
   settingsError.hidden = true;
   settingsError.textContent = "";
+}
+
+function showOrganizationError(message) {
+  organizeError.hidden = false;
+  organizeError.textContent = message;
+}
+
+function hideOrganizationError() {
+  organizeError.hidden = true;
+  organizeError.textContent = "";
 }
 
 function setJobProgress(progress, message) {
@@ -609,73 +1251,6 @@ function getStoredKey() {
   }
 }
 
-function hydrateLibraryFromCache() {
-  const cachedLibrary = getCachedLibrary();
-  if (!cachedLibrary) {
-    return;
-  }
-
-  state.library = cachedLibrary;
-  renderLibrary();
-}
-
-function getCachedLibrary() {
-  try {
-    const raw = localStorage.getItem(LIBRARY_CACHE_KEY);
-    if (!raw) {
-      return null;
-    }
-
-    const payload = JSON.parse(raw);
-    const files = Array.isArray(payload?.files) ? payload.files : [];
-    if (files.length === 0) {
-      return null;
-    }
-
-    return {
-      configured: Boolean(payload.configured),
-      connected: Boolean(payload.connected),
-      connect_url: payload.connect_url || CONNECT_URL,
-      files,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function syncLibraryCache(library, options = {}) {
-  if (options.clear) {
-    clearLibraryCache();
-    return;
-  }
-
-  if (library.files.length > 0) {
-    try {
-      localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify({
-        configured: library.configured,
-        connected: library.connected,
-        connect_url: library.connect_url,
-        files: library.files,
-      }));
-    } catch {
-      return;
-    }
-    return;
-  }
-
-  if (library.connected || !library.configured || options.preserveExistingFiles === false) {
-    clearLibraryCache();
-  }
-}
-
-function clearLibraryCache() {
-  try {
-    localStorage.removeItem(LIBRARY_CACHE_KEY);
-  } catch {
-    return;
-  }
-}
-
 function setStoredKey(value) {
   try {
     sessionStorage.setItem(KEY_STORAGE_KEY, value);
@@ -701,6 +1276,27 @@ function promptForKey() {
   });
 }
 
+function promptConfirm(options = {}) {
+  if (state.confirmResolver) {
+    resolveConfirm(false);
+  }
+
+  state.confirmPreviousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  state.confirmOpen = true;
+  confirmModal.hidden = false;
+  document.body.classList.add("is-modal-open");
+  confirmTitle.textContent = options.title || "Confirm";
+  confirmMessage.textContent = options.message || "";
+  confirmSubmit.textContent = options.confirmLabel || "Confirm";
+  confirmSubmit.classList.toggle("btn--danger", options.destructive !== false);
+  confirmSubmit.classList.toggle("btn--primary", options.destructive === false);
+
+  return new Promise((resolve) => {
+    state.confirmResolver = resolve;
+    window.setTimeout(() => confirmSubmit.focus(), 20);
+  });
+}
+
 function submitKeyPrompt(event) {
   event.preventDefault();
   const key = keyInput.value.trim();
@@ -722,17 +1318,25 @@ function resolveKeyPrompt(value) {
   keyInput.value = "";
   hideKeyError();
   keyModal.hidden = true;
+  syncBodyModalState();
+  restorePreviousFocus();
+  resolver(value);
+}
 
-  if (state.settingsOpen) {
-    document.body.classList.add("is-modal-open");
-  } else {
-    document.body.classList.remove("is-modal-open");
+function resolveConfirm(value) {
+  if (!state.confirmResolver) {
+    return;
   }
 
-  if (state.previousFocus) {
-    state.previousFocus.focus();
+  const resolver = state.confirmResolver;
+  state.confirmResolver = null;
+  state.confirmOpen = false;
+  confirmModal.hidden = true;
+  syncBodyModalState();
+  if (state.confirmPreviousFocus) {
+    state.confirmPreviousFocus.focus();
   }
-  state.previousFocus = null;
+  state.confirmPreviousFocus = null;
   resolver(value);
 }
 
@@ -744,6 +1348,234 @@ function showKeyError(message) {
 function hideKeyError() {
   keyError.hidden = true;
   keyError.textContent = "";
+}
+
+function hydrateLibraryFromCache() {
+  const cachedLibrary = getCachedLibrary();
+  if (!cachedLibrary) {
+    return;
+  }
+
+  state.library = cachedLibrary;
+  normalizeViewState();
+  renderLibraryState();
+}
+
+function getCachedLibrary() {
+  try {
+    const raw = localStorage.getItem(LIBRARY_CACHE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const payload = JSON.parse(raw);
+    const folders = normalizeFolders(payload?.folders);
+    const files = normalizeFiles(payload?.files, folders);
+    const hasMeaningfulFolders = folders.some((folder) => folder.id !== ROOT_FOLDER_ID);
+    if (files.length === 0 && !hasMeaningfulFolders) {
+      return null;
+    }
+
+    return {
+      configured: Boolean(payload?.configured),
+      connected: Boolean(payload?.connected),
+      connect_url: payload?.connect_url || CONNECT_URL,
+      files,
+      folders,
+      index_recovered: Boolean(payload?.index_recovered),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function syncLibraryCache(library, options = {}) {
+  if (options.clear) {
+    clearLibraryCache();
+    return;
+  }
+
+  const hasMeaningfulFolders = (library.folders || []).some((folder) => folder.id !== ROOT_FOLDER_ID);
+  if (library.files.length > 0 || hasMeaningfulFolders) {
+    try {
+      localStorage.setItem(
+        LIBRARY_CACHE_KEY,
+        JSON.stringify({
+          configured: library.configured,
+          connected: library.connected,
+          connect_url: library.connect_url,
+          files: library.files,
+          folders: library.folders,
+          index_recovered: library.index_recovered,
+        }),
+      );
+    } catch {
+      return;
+    }
+    return;
+  }
+
+  if (library.connected || !library.configured || options.preserveExistingFiles === false) {
+    clearLibraryCache();
+  }
+}
+
+function clearLibraryCache() {
+  try {
+    localStorage.removeItem(LIBRARY_CACHE_KEY);
+  } catch {
+    return;
+  }
+}
+
+function hydrateViewState() {
+  try {
+    const raw = localStorage.getItem(VIEW_STATE_KEY);
+    if (!raw) {
+      return;
+    }
+
+    const payload = JSON.parse(raw);
+    state.currentFolderId = typeof payload?.current_folder_id === "string" ? payload.current_folder_id : ROOT_FOLDER_ID;
+  } catch {
+    state.currentFolderId = ROOT_FOLDER_ID;
+  }
+}
+
+function persistViewState() {
+  try {
+    localStorage.setItem(
+      VIEW_STATE_KEY,
+      JSON.stringify({
+        current_folder_id: state.currentFolderId,
+      }),
+    );
+  } catch {
+    return;
+  }
+}
+
+function normalizeViewState() {
+  if (!getFolderById(state.currentFolderId)) {
+    state.currentFolderId = ROOT_FOLDER_ID;
+  }
+
+  if (state.editingVideoId && !state.library.files.some((file) => file.video_id === state.editingVideoId)) {
+    state.editingVideoId = "";
+  }
+
+  if (
+    state.selectedVideoId &&
+    !state.library.files.some((file) => file.video_id === state.selectedVideoId && file.folder_id === state.currentFolderId)
+  ) {
+    state.selectedVideoId = "";
+  }
+}
+
+function normalizeFolders(folders) {
+  const records = Array.isArray(folders) ? folders : [];
+  const folderMap = new Map();
+  folderMap.set(ROOT_FOLDER_ID, {
+    id: ROOT_FOLDER_ID,
+    name: "All files",
+    parent_id: null,
+  });
+
+  for (const folder of records) {
+    if (!folder || typeof folder.id !== "string" || !folder.id) {
+      continue;
+    }
+    if (folder.id === ROOT_FOLDER_ID) {
+      continue;
+    }
+    const name = String(folder.name || "").trim();
+    const parentId = typeof folder.parent_id === "string" && folder.parent_id ? folder.parent_id : ROOT_FOLDER_ID;
+    if (!name) {
+      continue;
+    }
+    folderMap.set(folder.id, {
+      id: folder.id,
+      name,
+      parent_id: parentId,
+    });
+  }
+
+  return Array.from(folderMap.values()).sort((left, right) => {
+    if (left.id === ROOT_FOLDER_ID) {
+      return -1;
+    }
+    if (right.id === ROOT_FOLDER_ID) {
+      return 1;
+    }
+    if (left.parent_id !== right.parent_id) {
+      return String(left.parent_id || "").localeCompare(String(right.parent_id || ""));
+    }
+    return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
+  });
+}
+
+function normalizeFiles(files, folders) {
+  const folderIds = new Set((folders || []).map((folder) => folder.id));
+  const records = Array.isArray(files) ? files : [];
+  return records.map((file) => normalizeFile(file, folderIds));
+}
+
+function normalizeFile(file, folders) {
+  const folderIds = folders instanceof Set ? folders : new Set((folders || []).map((folder) => folder.id));
+  const originalName = String(file?.original_filename || "");
+  const displayNameOverride = typeof file?.display_name_override === "string" && file.display_name_override.trim()
+    ? file.display_name_override.trim()
+    : null;
+  const folderId = typeof file?.folder_id === "string" && folderIds.has(file.folder_id) ? file.folder_id : ROOT_FOLDER_ID;
+
+  return {
+    ...file,
+    video_id: String(file?.video_id || ""),
+    original_filename: originalName,
+    media_type: String(file?.media_type || ""),
+    original_size: Number(file?.original_size) || 0,
+    uploaded_at: file?.uploaded_at || "",
+    folder_id: folderId,
+    display_name_override: displayNameOverride,
+    display_name: displayNameOverride || originalName,
+  };
+}
+
+function getFolderById(folderId) {
+  return state.library.folders.find((folder) => folder.id === folderId) || null;
+}
+
+function getCurrentFolder() {
+  return getFolderById(state.currentFolderId) || getFolderById(ROOT_FOLDER_ID);
+}
+
+function buildFolderChildMap() {
+  const childMap = new Map();
+  for (const folder of state.library.folders) {
+    const parentId = folder.parent_id || null;
+    if (!childMap.has(parentId)) {
+      childMap.set(parentId, []);
+    }
+    childMap.get(parentId).push(folder);
+  }
+
+  for (const children of childMap.values()) {
+    children.sort((left, right) => {
+      if (left.id === ROOT_FOLDER_ID) {
+        return -1;
+      }
+      if (right.id === ROOT_FOLDER_ID) {
+        return 1;
+      }
+      return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
+    });
+  }
+
+  return childMap;
+}
+
+function getVisibleFiles() {
+  return state.library.files.filter((file) => file.folder_id === state.currentFolderId);
 }
 
 function setFlash(type, message, source = "general") {
@@ -846,22 +1678,6 @@ function clearFlashTimer() {
   }
 }
 
-function buildLibrarySignature(library) {
-  return JSON.stringify({
-    configured: Boolean(library?.configured),
-    connected: Boolean(library?.connected),
-    files: Array.isArray(library?.files)
-      ? library.files.map((file) => [
-          file.video_id || "",
-          file.original_filename || "",
-          Number(file.original_size) || 0,
-          file.uploaded_at || "",
-          file.media_type || "",
-        ])
-      : [],
-  });
-}
-
 async function fetchJson(url, options, fallbackMessage) {
   const response = await fetch(url, options);
   let payload = {};
@@ -877,6 +1693,18 @@ async function fetchJson(url, options, fallbackMessage) {
   }
 
   return payload;
+}
+
+function syncBodyModalState() {
+  const anyModalOpen = state.settingsOpen || state.organizationOpen || state.confirmOpen || !keyModal.hidden;
+  document.body.classList.toggle("is-modal-open", anyModalOpen);
+}
+
+function restorePreviousFocus() {
+  if (state.previousFocus) {
+    state.previousFocus.focus();
+  }
+  state.previousFocus = null;
 }
 
 function uploadIconMarkup() {
@@ -902,6 +1730,17 @@ function downloadIconMarkup() {
       <path d="M12 4v10" />
       <path d="M8.5 10.5 12 14l3.5-3.5" />
       <path d="M5 18.5h14" />
+    </svg>
+  `;
+}
+
+function deleteIconMarkup() {
+  return `
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 6h18" />
+      <path d="M8 6V4h8v2" />
+      <path d="M19 6l-1 14H6L5 6" />
+      <path d="M10 10v6M14 10v6" />
     </svg>
   `;
 }

@@ -6,6 +6,7 @@ from server.youtube import (
     InMemoryYouTubeStore,
     PersistentYouTubeStore,
     YouTubeService,
+    YOUTUBE_SCOPES,
     build_youtube_description,
     build_youtube_title,
     parse_youtube_description,
@@ -45,6 +46,9 @@ class FakePlaylistItemsApi:
 
 
 class FakeVideosApi:
+    def __init__(self):
+        self.deleted_video_id = None
+
     def list(self, *, part, id):
         del part
         items = []
@@ -76,6 +80,10 @@ class FakeVideosApi:
                 }
             )
         return FakeExecutable({"items": items})
+
+    def delete(self, *, id):
+        self.deleted_video_id = id
+        return FakeExecutable({})
 
 
 class FakeYouTubeApi:
@@ -146,6 +154,35 @@ def test_persistent_youtube_store_reset_removes_saved_state(tmp_path) -> None:
     assert store.get_client_config() == (None, None)
     assert store.get_credentials() is None
     assert not store_path.exists()
+
+
+def test_session_status_uses_saved_credentials_without_touching_youtube() -> None:
+    store = InMemoryYouTubeStore()
+    store.set_client_config("client-id", "client-secret")
+    store.set_credentials(DummyCredentials())
+    service = YouTubeService(store=store)
+
+    status = service.session_status()
+
+    assert status.configured is True
+    assert status.connected is True
+
+
+def test_setting_same_client_config_keeps_saved_credentials() -> None:
+    store = InMemoryYouTubeStore()
+    store.set_client_config("client-id", "client-secret")
+    store.set_credentials(DummyCredentials())
+    service = YouTubeService(store=store)
+
+    service.set_runtime_client_config(client_id="client-id", client_secret="client-secret")
+
+    assert store.get_credentials() is not None
+
+
+def test_youtube_scopes_cover_upload_read_and_manage() -> None:
+    assert "https://www.googleapis.com/auth/youtube" in YOUTUBE_SCOPES
+    assert "https://www.googleapis.com/auth/youtube.upload" in YOUTUBE_SCOPES
+    assert "https://www.googleapis.com/auth/youtube.readonly" in YOUTUBE_SCOPES
 
 
 def test_list_files_fetches_entire_upload_history(monkeypatch) -> None:
@@ -222,3 +259,13 @@ def test_download_commands_enable_js_runtime_when_node_is_available(monkeypatch)
     assert "node:/opt/homebrew/bin/node" in commands[0]
     assert "--remote-components" in commands[0]
     assert "ejs:github" in commands[0]
+
+
+def test_delete_video_calls_youtube_delete(monkeypatch) -> None:
+    api = FakeYouTubeApi({"__first__": {"items": []}})
+    service = YouTubeService(store=InMemoryYouTubeStore())
+    monkeypatch.setattr(service, "_build_service", lambda: api)
+
+    service.delete_video("video-123")
+
+    assert api._videos_api.deleted_video_id == "video-123"

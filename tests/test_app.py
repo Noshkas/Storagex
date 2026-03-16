@@ -9,8 +9,10 @@ from fastapi.testclient import TestClient
 
 import server.app as server_app
 from server.youtube import (
+    InMemoryYouTubeStore,
     YouTubeAuthError,
     YouTubeConfigurationError,
+    YouTubeError,
     YouTubeFileRecord,
     YouTubeSessionStatus,
 )
@@ -111,11 +113,20 @@ class FakeYouTubeService:
         output_path.write_bytes(payload)
         return output_path
 
+    def delete_video(self, video_id: str) -> None:
+        self.files = [item for item in self.files if item.video_id != video_id]
+        self._remote_video_payloads.pop(video_id, None)
+
 
 class FakeFailingAuthYouTubeService:
     def complete_authorization(self, *, state: str, code: str, redirect_uri: str) -> None:
         del state, code, redirect_uri
         raise YouTubeAuthError("Google rejected the client secret.")
+
+
+class FakeUnavailableYouTubeService(FakeYouTubeService):
+    def list_files(self) -> list[YouTubeFileRecord]:
+        raise YouTubeError("Could not read the connected YouTube channel.")
 
 
 class FakeCredentials:
@@ -255,25 +266,7 @@ def test_api_rejects_invalid_key(isolated_jobs_dir) -> None:
 
 def test_library_lists_youtube_backed_files(isolated_jobs_dir, monkeypatch) -> None:
     fake_youtube = FakeYouTubeService()
-    fake_youtube.files.append(
-        YouTubeFileRecord(
-            video_id="video-1",
-            original_filename="hello.txt",
-            media_type="text/plain",
-            original_size=1024,
-            stored_size=1024,
-            sha256="abc123",
-            crc32="deadbeef",
-            frame_count=2,
-            fps=24,
-            uploaded_at="2026-03-16T10:00:00Z",
-            privacy_status="private",
-            watch_url="https://www.youtube.com/watch?v=video-1",
-            studio_url="https://studio.youtube.com/video/video-1/edit",
-            thumbnail_url=None,
-            youtube_title="StorageX · hello.txt",
-        )
-    )
+    fake_youtube.files.append(_youtube_file(video_id="video-1", original_filename="hello.txt"))
     monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
 
     with TestClient(server_app.app) as client:
@@ -284,6 +277,151 @@ def test_library_lists_youtube_backed_files(isolated_jobs_dir, monkeypatch) -> N
         assert payload["channel_title"] == "Test Channel"
         assert len(payload["files"]) == 1
         assert payload["files"][0]["original_filename"] == "hello.txt"
+        assert payload["files"][0]["folder_id"] == "root"
+        assert payload["folders"] == [{"id": "root", "name": "All files", "parent_id": None}]
+
+
+def test_library_recovers_from_corrupt_local_index(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    fake_youtube.files.append(_youtube_file(video_id="video-1", original_filename="hello.txt"))
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+    server_app.library_index._path.write_text("{broken", encoding="utf-8")
+
+    with TestClient(server_app.app) as client:
+        response = client.get("/api/library")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["index_recovered"] is True
+    assert payload["files"][0]["folder_id"] == "root"
+    assert payload["folders"] == [{"id": "root", "name": "All files", "parent_id": None}]
+
+
+def test_folder_endpoints_create_and_reject_cycles(isolated_jobs_dir) -> None:
+    with TestClient(server_app.app) as client:
+        parent_response = client.post("/api/library/folders", json={"name": "Work"})
+        assert parent_response.status_code == 200
+        parent_id = parent_response.json()["folder"]["id"]
+
+        child_response = client.post("/api/library/folders", json={"name": "2026", "parent_id": parent_id})
+        assert child_response.status_code == 200
+        child_id = child_response.json()["folder"]["id"]
+
+        cycle_response = client.patch(f"/api/library/folders/{parent_id}", json={"parent_id": child_id})
+        assert cycle_response.status_code == 400
+        assert cycle_response.json()["detail"] == "Folders cannot be moved into themselves."
+
+
+def test_upload_uses_folder_assignment_and_local_rename_for_downloads(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        folder_response = client.post("/api/library/folders", json={"name": "Receipts"})
+        assert folder_response.status_code == 200
+        folder_id = folder_response.json()["folder"]["id"]
+
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 32, "text/plain")},
+            data={"key": VALID_KEY, "folder_id": folder_id},
+        )
+        assert upload_response.status_code == 200
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        assert upload_job["metadata"]["remote_file"]["folder_id"] == folder_id
+
+        rename_response = client.patch(
+            f"/api/library/files/{video_id}",
+            json={"display_name": "Receipt_March_2026.txt"},
+        )
+        assert rename_response.status_code == 200
+        assert rename_response.json()["file"]["display_name"] == "Receipt_March_2026.txt"
+
+        library_response = client.get("/api/library")
+        assert library_response.status_code == 200
+        library_file = library_response.json()["files"][0]
+        assert library_file["folder_id"] == folder_id
+        assert library_file["display_name_override"] == "Receipt_March_2026.txt"
+        assert library_file["display_name"] == "Receipt_March_2026.txt"
+
+        download_response = client.post(
+            f"/api/files/{video_id}/download",
+            data={"key": VALID_KEY},
+        )
+        assert download_response.status_code == 200
+        download_job = _wait_for_completion(client, download_response.json()["job_id"])
+        assert download_job["metadata"]["original_filename"] == "hello.txt"
+        assert download_job["metadata"]["display_filename"] == "Receipt_March_2026.txt"
+
+
+def test_delete_folder_moves_files_back_to_root(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        parent_response = client.post("/api/library/folders", json={"name": "Work"})
+        assert parent_response.status_code == 200
+        parent_id = parent_response.json()["folder"]["id"]
+
+        child_response = client.post("/api/library/folders", json={"name": "Reports", "parent_id": parent_id})
+        assert child_response.status_code == 200
+        child_id = child_response.json()["folder"]["id"]
+
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 32, "text/plain")},
+            data={"key": VALID_KEY, "folder_id": child_id},
+        )
+        assert upload_response.status_code == 200
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+
+        delete_response = client.delete(f"/api/library/folders/{parent_id}")
+        assert delete_response.status_code == 200
+        payload = delete_response.json()
+        assert payload["status"] == "deleted"
+        assert set(payload["result"]["deleted_folder_ids"]) == {parent_id, child_id}
+        assert payload["result"]["moved_file_ids"] == [video_id]
+
+        library_response = client.get("/api/library")
+        assert library_response.status_code == 200
+        library_payload = library_response.json()
+        assert library_payload["folders"] == [{"id": "root", "name": "All files", "parent_id": None}]
+        assert library_payload["files"][0]["folder_id"] == "root"
+
+
+def test_delete_root_folder_is_rejected(isolated_jobs_dir) -> None:
+    with TestClient(server_app.app) as client:
+        response = client.delete("/api/library/folders/root")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "The root folder cannot be deleted."
+
+
+def test_delete_file_removes_it_from_library_and_youtube(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 16, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        assert upload_response.status_code == 200
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+
+        delete_response = client.delete(f"/api/library/files/{video_id}")
+        assert delete_response.status_code == 200
+        assert delete_response.json()["status"] == "deleted"
+        assert fake_youtube.files == []
+        assert video_id not in fake_youtube._remote_video_payloads
+
+        library_response = client.get("/api/library")
+        assert library_response.status_code == 200
+        assert library_response.json()["files"] == []
 
 
 def test_settings_can_be_saved_at_runtime(isolated_jobs_dir, monkeypatch) -> None:
@@ -362,11 +500,23 @@ def test_youtube_connect_redirects_back_to_app_when_not_configured(isolated_jobs
     assert query["reason"] == ["Save a YouTube client ID and client secret first."]
 
 
+def test_library_keeps_saved_connection_when_youtube_read_temporarily_fails(isolated_jobs_dir, monkeypatch) -> None:
+    monkeypatch.setattr(server_app, "youtube_service", FakeUnavailableYouTubeService())
+
+    with TestClient(server_app.app) as client:
+        response = client.get("/api/library")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["connected"] is True
+    assert payload["error"] == "Could not read the connected YouTube channel."
+
+
 def test_youtube_authorization_reuses_pkce_verifier(isolated_jobs_dir, monkeypatch) -> None:
     from server.youtube import YouTubeService
 
     FakeFlow.instances.clear()
-    service = YouTubeService()
+    service = YouTubeService(store=InMemoryYouTubeStore())
     service.set_runtime_client_config(client_id="client-id", client_secret="client-secret")
     monkeypatch.setattr(service, "_import_flow", lambda: FakeFlow)
 
@@ -460,3 +610,23 @@ def _wait_for_completion(client: TestClient, job_id: str, timeout: float = 30.0)
             return payload
         time.sleep(0.1)
     raise AssertionError(f"Job {job_id} did not finish in time.")
+
+
+def _youtube_file(*, video_id: str, original_filename: str) -> YouTubeFileRecord:
+    return YouTubeFileRecord(
+        video_id=video_id,
+        original_filename=original_filename,
+        media_type="text/plain",
+        original_size=1024,
+        stored_size=1024,
+        sha256=f"sha-{video_id}",
+        crc32=f"crc-{video_id}",
+        frame_count=2,
+        fps=24,
+        uploaded_at="2026-03-16T10:00:00Z",
+        privacy_status="private",
+        watch_url=f"https://www.youtube.com/watch?v={video_id}",
+        studio_url=f"https://studio.youtube.com/video/{video_id}/edit",
+        thumbnail_url=None,
+        youtube_title=f"StorageX · {original_filename}",
+    )

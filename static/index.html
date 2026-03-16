@@ -21,7 +21,29 @@
           <img src="/static/favicon.svg?v=__ASSET_VERSION__" class="app-bar__logo" alt="" aria-hidden="true" width="20" height="20" />
           <span class="app-bar__name">StorageX</span>
         </div>
+        <div class="app-bar__center">
+          <div id="folder-dropdown" class="folder-dropdown">
+            <button id="folder-dropdown-btn" class="folder-dropdown__btn" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Current folder">
+              <span id="folder-dropdown-label" class="folder-dropdown__label">All files</span>
+              <svg class="folder-dropdown__chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+            <div id="folder-dropdown-panel" class="folder-dropdown__panel" role="listbox" hidden></div>
+          </div>
+        </div>
         <div class="app-bar__actions">
+          <button id="new-folder-button" class="nav-btn" type="button" aria-label="New folder" title="New folder">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14"/>
+            </svg>
+          </button>
+          <button id="delete-folder-button" class="nav-btn" type="button" aria-label="Delete folder" title="Delete folder">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 6h18" />
+              <path d="M8 6V4h8v2" />
+              <path d="M19 6l-1 14H6L5 6" />
+              <path d="M10 10v6M14 10v6" />
+            </svg>
+          </button>
           <button id="settings-button" class="nav-btn" type="button" aria-label="Settings" title="Settings">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M10.65 4.35a1.9 1.9 0 0 1 2.7 0l.54.55c.25.24.61.34.95.25l.76-.2a1.9 1.9 0 0 1 2.33 1.64l.08.76c.04.35.27.66.59.82l.69.34a1.9 1.9 0 0 1 .88 2.55l-.33.69c-.16.32-.16.71 0 1.03l.33.69a1.9 1.9 0 0 1-.88 2.55l-.69.34a1.1 1.1 0 0 0-.59.82l-.08.76a1.9 1.9 0 0 1-2.33 1.64l-.76-.2a1.1 1.1 0 0 0-.95.25l-.54.55a1.9 1.9 0 0 1-2.7 0l-.54-.55a1.1 1.1 0 0 0-.95-.25l-.76.2a1.9 1.9 0 0 1-2.33-1.64l-.08-.76a1.1 1.1 0 0 0-.59-.82l-.69-.34a1.9 1.9 0 0 1-.88-2.55l.33-.69a1.16 1.16 0 0 0 0-1.03l-.33-.69a1.9 1.9 0 0 1 .88-2.55l.69-.34c.32-.16.55-.47.59-.82l.08-.76A1.9 1.9 0 0 1 8.4 4.95l.76.2c.34.09.7-.01.95-.25l.54-.55Z" />
@@ -36,19 +58,21 @@
     </header>
 
     <main class="app-main">
-      <section id="data-table" class="data-table" aria-label="Stored files">
-        <div class="data-table__head">
-          <span>Name</span>
-          <span>Type</span>
-          <span>Size</span>
-          <span>Uploaded</span>
-          <span>Download</span>
-        </div>
-        <div id="files-list" class="data-table__body"></div>
-      </section>
+      <section class="library-card" aria-label="Library">
+        <section id="data-table" class="data-table" aria-label="Stored files">
+          <div class="data-table__head">
+            <span>Name</span>
+            <span>Type</span>
+            <span>Size</span>
+            <span>Uploaded</span>
+            <span>Download</span>
+          </div>
+          <div id="files-list" class="data-table__body"></div>
+        </section>
 
-      <section id="empty-state" class="empty-state" hidden>
-        <p id="empty-title" class="empty-title">No files</p>
+        <section id="empty-state" class="empty-state" hidden>
+          <p id="empty-title" class="empty-title">No files</p>
+        </section>
       </section>
     </main>
 
@@ -110,6 +134,49 @@
         </form>
 
         <button id="disconnect-button" class="settings-disconnect" type="button" hidden>Disconnect YouTube</button>
+        <button id="reset-button" class="settings-disconnect" type="button" hidden>Reset local YouTube setup</button>
+      </div>
+    </div>
+
+    <div id="organize-modal" class="modal" hidden>
+      <div class="modal__backdrop"></div>
+      <div class="modal__panel modal__panel--sm" role="dialog" aria-modal="true" aria-labelledby="organize-title">
+        <div class="modal__head">
+          <h2 id="organize-title" class="modal__title">New folder</h2>
+          <button id="organize-close" class="icon-btn" type="button" aria-label="Close dialog">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true">
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        <form id="organize-form" class="modal__form">
+          <label id="organize-name-field" class="field">
+            <span id="organize-name-label" class="field-label">Folder name</span>
+            <input id="organize-name" class="field-input" type="text" autocomplete="off" />
+          </label>
+
+          <div id="folder-color-field" class="field" hidden>
+            <span class="field-label">Color</span>
+            <div id="folder-color-picker" class="color-picker" role="group" aria-label="Folder color">
+              <button type="button" class="color-swatch" data-color="rose"  style="--swatch-bg:#fde8e8;--swatch-border:#f0b8b8" aria-label="Rose"></button>
+              <button type="button" class="color-swatch" data-color="coral" style="--swatch-bg:#fee8e0;--swatch-border:#f5a888" aria-label="Coral"></button>
+              <button type="button" class="color-swatch" data-color="amber" style="--swatch-bg:#fef3e0;--swatch-border:#f5cc80" aria-label="Amber"></button>
+              <button type="button" class="color-swatch" data-color="lime"  style="--swatch-bg:#eaf5e8;--swatch-border:#a8d8a4" aria-label="Lime"></button>
+              <button type="button" class="color-swatch" data-color="mint"  style="--swatch-bg:#e0f8ec;--swatch-border:#80d4a8" aria-label="Mint"></button>
+              <button type="button" class="color-swatch" data-color="teal"  style="--swatch-bg:#e0f5f2;--swatch-border:#88d8ce" aria-label="Teal"></button>
+              <button type="button" class="color-swatch" data-color="sky"   style="--swatch-bg:#e0eeff;--swatch-border:#90bcf5" aria-label="Sky"></button>
+              <button type="button" class="color-swatch" data-color="iris"  style="--swatch-bg:#ece8ff;--swatch-border:#b4a4f0" aria-label="Iris"></button>
+              <button type="button" class="color-swatch" data-color="pink"  style="--swatch-bg:#fde8f5;--swatch-border:#f0a8d8" aria-label="Pink"></button>
+            </div>
+          </div>
+
+          <p id="organize-error" class="form-error" hidden></p>
+          <div class="modal__actions">
+            <button id="organize-cancel" class="btn btn--ghost" type="button">Cancel</button>
+            <button id="organize-submit" class="btn btn--primary" type="submit">Save</button>
+          </div>
+        </form>
       </div>
     </div>
 
@@ -138,6 +205,25 @@
             <button class="btn btn--primary" type="submit">Confirm</button>
           </div>
         </form>
+      </div>
+    </div>
+
+    <div id="confirm-modal" class="modal modal--confirm" hidden>
+      <div class="modal__backdrop"></div>
+      <div class="modal__panel modal__panel--sm" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div class="modal__head">
+          <h2 id="confirm-title" class="modal__title">Confirm</h2>
+          <button id="confirm-close" class="icon-btn" type="button" aria-label="Close confirmation">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true">
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <p id="confirm-message" class="modal__copy"></p>
+        <div class="modal__actions">
+          <button id="confirm-cancel" class="btn btn--ghost" type="button">Cancel</button>
+          <button id="confirm-submit" class="btn btn--danger" type="button">Delete</button>
+        </div>
       </div>
     </div>
   </body>

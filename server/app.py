@@ -28,7 +28,16 @@ from .codec.constants import (
 )
 from .codec.keyed import validate_numeric_key
 from .file_utils import guess_media_type, sanitize_filename
-from .youtube import YouTubeAuthError, YouTubeConfigurationError, YouTubeError, YouTubeService
+from .library_index import (
+    ROOT_FOLDER_ID,
+    UNSET,
+    FileEntryNotFoundError,
+    FolderConflictError,
+    FolderNotFoundError,
+    LibraryIndexError,
+    LibraryIndexStore,
+)
+from .youtube import YouTubeAuthError, YouTubeConfigurationError, YouTubeError, YouTubeService, YouTubeSessionExpiredError
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +100,27 @@ class JobStore:
 
 jobs = JobStore()
 youtube_service = YouTubeService()
+library_index = LibraryIndexStore()
 
 
 class YouTubeSettingsPayload(BaseModel):
     client_id: str
     client_secret: str
+
+
+class FolderCreatePayload(BaseModel):
+    name: str
+    parent_id: str | None = ROOT_FOLDER_ID
+
+
+class FolderUpdatePayload(BaseModel):
+    name: str | None = None
+    parent_id: str | None = None
+
+
+class FileUpdatePayload(BaseModel):
+    folder_id: str | None = None
+    display_name: str | None = None
 
 
 @asynccontextmanager
@@ -208,17 +233,23 @@ async def save_youtube_settings(payload: YouTubeSettingsPayload) -> dict[str, An
 async def get_library(request: Request) -> dict[str, Any]:
     status = youtube_service.session_status()
     library_error: str | None = None
-    files: list[dict[str, Any]] = []
+    remote_files: list[Any] | None = None
 
     if status.connected:
         try:
-            files = [item.to_dict() for item in youtube_service.list_files()]
-        except YouTubeAuthError:
+            remote_files = youtube_service.list_files()
+        except YouTubeSessionExpiredError:
             youtube_service.disconnect()
             status = youtube_service.session_status()
             library_error = "Your YouTube session expired. Connect YouTube again."
         except YouTubeError as exc:
             library_error = str(exc)
+
+    index_snapshot = library_index.snapshot(remote_files)
+    files = []
+    for remote_file in remote_files or []:
+        entry = index_snapshot.files.get(remote_file.video_id)
+        files.append(_serialize_library_file(remote_file, entry))
 
     return {
         "configured": status.configured,
@@ -227,7 +258,121 @@ async def get_library(request: Request) -> dict[str, Any]:
         "privacy_status": status.privacy_status,
         "connect_url": str(request.url_for("youtube_connect")),
         "files": files,
+        "folders": [folder.to_dict() for folder in index_snapshot.folders],
+        "index_recovered": index_snapshot.recovered,
         "error": library_error,
+    }
+
+
+@app.post("/api/library/folders")
+async def create_library_folder(payload: FolderCreatePayload) -> dict[str, Any]:
+    try:
+        folder = library_index.create_folder(
+            name=payload.name,
+            parent_id=(payload.parent_id or ROOT_FOLDER_ID).strip() or ROOT_FOLDER_ID,
+        )
+    except FolderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (FolderConflictError, LibraryIndexError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "created",
+        "folder": folder.to_dict(),
+    }
+
+
+@app.patch("/api/library/folders/{folder_id}")
+async def update_library_folder(folder_id: str, payload: FolderUpdatePayload) -> dict[str, Any]:
+    if not payload.model_fields_set:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+
+    try:
+        folder = library_index.update_folder(
+            folder_id,
+            name=payload.name if "name" in payload.model_fields_set else UNSET,
+            parent_id=payload.parent_id if "parent_id" in payload.model_fields_set else UNSET,
+        )
+    except FolderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (FolderConflictError, LibraryIndexError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "updated",
+        "folder": folder.to_dict(),
+    }
+
+
+@app.delete("/api/library/folders/{folder_id}")
+async def delete_library_folder(folder_id: str) -> dict[str, Any]:
+    try:
+        result = library_index.delete_folder(folder_id)
+    except FolderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except LibraryIndexError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "deleted",
+        "result": result.to_dict(),
+    }
+
+
+@app.patch("/api/library/files/{video_id}")
+async def update_library_file(video_id: str, payload: FileUpdatePayload) -> dict[str, Any]:
+    if not payload.model_fields_set:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+
+    _ensure_local_file_entry(video_id)
+
+    try:
+        entry = library_index.update_file(
+            video_id,
+            folder_id=payload.folder_id if "folder_id" in payload.model_fields_set else UNSET,
+            display_name=payload.display_name if "display_name" in payload.model_fields_set else UNSET,
+        )
+    except FolderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileEntryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except LibraryIndexError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "updated",
+        "file": entry.to_dict(),
+    }
+
+
+@app.delete("/api/library/files/{video_id}")
+async def delete_library_file(video_id: str) -> dict[str, Any]:
+    youtube_status = youtube_service.session_status()
+    if not youtube_status.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Save a YouTube client ID and client secret first.",
+        )
+    if not youtube_status.connected:
+        raise HTTPException(status_code=409, detail="Connect YouTube before deleting files.")
+
+    try:
+        _ensure_local_file_entry(video_id)
+        youtube_service.delete_video(video_id)
+        entry = library_index.delete_file(video_id)
+    except YouTubeSessionExpiredError as exc:
+        youtube_service.disconnect()
+        raise HTTPException(status_code=409, detail="Your YouTube session expired. Connect YouTube again.") from exc
+    except YouTubeAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileEntryNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except YouTubeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "deleted",
+        "file": entry.to_dict(),
     }
 
 
@@ -236,6 +381,7 @@ async def start_remote_upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     key: str = Form(...),
+    folder_id: str = Form(ROOT_FOLDER_ID),
 ) -> dict[str, str]:
     original_filename = sanitize_filename(file.filename, fallback="upload.bin")
     extension = Path(original_filename).suffix.lower()
@@ -255,6 +401,8 @@ async def start_remote_upload(
         )
     if not youtube_status.connected:
         raise HTTPException(status_code=409, detail="Connect YouTube before uploading files.")
+    if not library_index.folder_exists(folder_id):
+        raise HTTPException(status_code=404, detail="Folder not found.")
 
     content = await file.read(MAX_UPLOAD_SIZE + 1)
     if len(content) > MAX_UPLOAD_SIZE:
@@ -270,6 +418,7 @@ async def start_remote_upload(
         original_filename,
         media_type,
         normalized_key,
+        folder_id,
     )
     return {"job_id": job.job_id, "status": job.status}
 
@@ -370,7 +519,14 @@ async def get_artifact(job_id: str, artifact_path: str) -> FileResponse:
     return FileResponse(candidate, media_type=media_type)
 
 
-def _run_remote_upload_job(job_id: str, source_path: Path, original_filename: str, media_type: str, key: str) -> None:
+def _run_remote_upload_job(
+    job_id: str,
+    source_path: Path,
+    original_filename: str,
+    media_type: str,
+    key: str,
+    folder_id: str,
+) -> None:
     from .codec.service import CodecError, encode_file
     from .codec.video import encode_frames_to_youtube_mp4
 
@@ -409,6 +565,7 @@ def _run_remote_upload_job(job_id: str, source_path: Path, original_filename: st
                 message=message,
             ),
         )
+        local_entry = library_index.ensure_file(remote_file.video_id, folder_id=folder_id)
     except CodecError as exc:
         jobs.update(job_id, status="failed", error=str(exc), message="Upload failed.")
         return
@@ -422,7 +579,7 @@ def _run_remote_upload_job(job_id: str, source_path: Path, original_filename: st
         shutil.rmtree(job_dir, ignore_errors=True)
 
     manifest = result.manifest
-    remote_payload = remote_file.to_dict()
+    remote_payload = _serialize_library_file(remote_file, local_entry)
     jobs.update(
         job_id,
         status="completed",
@@ -482,6 +639,7 @@ def _run_remote_download_job(job_id: str, video_id: str, key: str) -> None:
         return
 
     manifest = result.manifest
+    display_filename = library_index.resolve_download_name(video_id, str(manifest["original_filename"]))
     jobs.update(
         job_id,
         status="completed",
@@ -491,6 +649,7 @@ def _run_remote_download_job(job_id: str, video_id: str, key: str) -> None:
         else "Recovered file from YouTube, but integrity validation failed.",
         metadata={
             "original_filename": manifest["original_filename"],
+            "display_filename": display_filename,
             "media_type": manifest["media_type"],
             "original_size": manifest["original_size"],
             "compressed": manifest["compressed"],
@@ -610,6 +769,30 @@ def _run_decode_job(job_id: str, source_path: Path, key: str) -> None:
             "manifest": str(result.manifest_path.relative_to(job_dir)),
         },
     )
+
+
+def _serialize_library_file(remote_file: Any, entry: Any) -> dict[str, Any]:
+    payload = remote_file.to_dict()
+    display_name_override = entry.display_name if entry is not None else None
+    payload["folder_id"] = entry.folder_id if entry is not None else ROOT_FOLDER_ID
+    payload["display_name"] = display_name_override or payload["original_filename"]
+    payload["display_name_override"] = display_name_override
+    return payload
+
+
+def _ensure_local_file_entry(video_id: str) -> None:
+    if library_index.has_file(video_id):
+        return
+
+    if not youtube_service.session_status().connected:
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    try:
+        youtube_service.get_file(video_id)
+    except YouTubeError as exc:
+        raise HTTPException(status_code=404, detail="File not found.") from exc
+
+    library_index.ensure_file(video_id)
 
 
 def _write_upload(job_id: str, content: bytes, original_filename: str) -> Path:

@@ -1,0 +1,668 @@
+from __future__ import annotations
+
+import logging
+import mimetypes
+import shutil
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
+
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from .codec.constants import (
+    ALLOWED_DECODE_EXTENSIONS,
+    ALLOWED_INPUT_EXTENSIONS,
+    JOBS_DIR,
+    JOB_TTL_SECONDS,
+    MAX_DECODE_UPLOAD_SIZE,
+    MAX_UPLOAD_SIZE,
+    YOUTUBE_VIDEO_NAME,
+)
+from .codec.keyed import validate_numeric_key
+from .file_utils import guess_media_type, sanitize_filename
+from .youtube import YouTubeAuthError, YouTubeConfigurationError, YouTubeError, YouTubeService
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class JobRecord:
+    job_id: str
+    kind: str
+    status: str
+    progress: int
+    message: str
+    created_at: float
+    updated_at: float
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    artifacts: dict[str, Any] = field(default_factory=dict)
+
+
+class JobStore:
+    def __init__(self) -> None:
+        self._jobs: dict[str, JobRecord] = {}
+        self._lock = threading.Lock()
+
+    def create(self, kind: str) -> JobRecord:
+        now = time.time()
+        job = JobRecord(
+            job_id=uuid.uuid4().hex,
+            kind=kind,
+            status="queued",
+            progress=0,
+            message="Queued.",
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self._jobs[job.job_id] = job
+        return job
+
+    def get(self, job_id: str) -> JobRecord:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            return job
+
+    def update(self, job_id: str, **changes: Any) -> JobRecord:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            for key, value in changes.items():
+                setattr(job, key, value)
+            job.updated_at = time.time()
+            return job
+
+    def snapshot(self, job_id: str) -> JobRecord:
+        job = self.get(job_id)
+        return JobRecord(**asdict(job))
+
+
+jobs = JobStore()
+youtube_service = YouTubeService()
+
+
+class YouTubeSettingsPayload(BaseModel):
+    client_id: str
+    client_secret: str
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_expired_jobs()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/")
+async def index() -> HTMLResponse:
+    index_path = Path("static/index.html")
+    asset_paths = [
+        index_path,
+        Path("static/app.js"),
+        Path("static/styles.css"),
+        Path("static/favicon.svg"),
+    ]
+    asset_version = max(int(path.stat().st_mtime) for path in asset_paths if path.exists())
+    html = index_path.read_text(encoding="utf-8").replace("__ASSET_VERSION__", str(asset_version))
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/favicon.ico")
+async def favicon() -> FileResponse:
+    return FileResponse("static/favicon.svg", media_type="image/svg+xml")
+
+
+@app.get("/auth/youtube/start", name="youtube_connect")
+async def youtube_connect(request: Request) -> RedirectResponse:
+    redirect_uri = str(request.url_for("youtube_callback"))
+    try:
+        authorization_url = youtube_service.authorization_url(redirect_uri)
+    except YouTubeConfigurationError as exc:
+        return RedirectResponse(
+            url=f"/?{urlencode({'youtube': 'error', 'reason': str(exc)})}",
+            status_code=302,
+        )
+    return RedirectResponse(authorization_url, status_code=302)
+
+
+@app.get("/auth/youtube/callback", name="youtube_callback")
+async def youtube_callback(
+    request: Request,
+    state: str | None = None,
+    code: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+    if error:
+        return RedirectResponse(
+            url=f"/?{urlencode({'youtube': 'error', 'reason': error})}",
+            status_code=302,
+        )
+
+    if not state or not code:
+        return RedirectResponse(
+            url=f"/?{urlencode({'youtube': 'error', 'reason': 'Missing authorization response from Google.'})}",
+            status_code=302,
+        )
+
+    redirect_uri = str(request.url_for("youtube_callback"))
+    try:
+        youtube_service.complete_authorization(state=state, code=code, redirect_uri=redirect_uri)
+    except YouTubeError as exc:
+        logger.warning("YouTube OAuth callback failed: %s", exc, exc_info=True)
+        return RedirectResponse(
+            url=f"/?{urlencode({'youtube': 'error', 'reason': str(exc)})}",
+            status_code=302,
+        )
+
+    return RedirectResponse(url=f"/?{urlencode({'youtube': 'connected'})}", status_code=302)
+
+
+@app.post("/api/auth/disconnect")
+async def disconnect_youtube() -> dict[str, str]:
+    youtube_service.disconnect()
+    return {"status": "disconnected"}
+
+
+@app.post("/api/auth/reset")
+async def reset_youtube_local_state() -> dict[str, Any]:
+    settings = youtube_service.reset_local_state()
+    return {
+        "status": "reset",
+        "settings": settings,
+    }
+
+
+@app.get("/api/settings/youtube")
+async def get_youtube_settings() -> dict[str, Any]:
+    return youtube_service.settings_snapshot()
+
+
+@app.post("/api/settings/youtube")
+async def save_youtube_settings(payload: YouTubeSettingsPayload) -> dict[str, Any]:
+    try:
+        return youtube_service.set_runtime_client_config(
+            client_id=payload.client_id,
+            client_secret=payload.client_secret,
+        )
+    except YouTubeConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/library")
+async def get_library(request: Request) -> dict[str, Any]:
+    status = youtube_service.session_status()
+    library_error: str | None = None
+    files: list[dict[str, Any]] = []
+
+    if status.connected:
+        try:
+            files = [item.to_dict() for item in youtube_service.list_files()]
+        except YouTubeAuthError:
+            youtube_service.disconnect()
+            status = youtube_service.session_status()
+            library_error = "Your YouTube session expired. Connect YouTube again."
+        except YouTubeError as exc:
+            library_error = str(exc)
+
+    return {
+        "configured": status.configured,
+        "connected": status.connected,
+        "channel_title": status.channel_title,
+        "privacy_status": status.privacy_status,
+        "connect_url": str(request.url_for("youtube_connect")),
+        "files": files,
+        "error": library_error,
+    }
+
+
+@app.post("/api/files")
+async def start_remote_upload(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    key: str = Form(...),
+) -> dict[str, str]:
+    original_filename = sanitize_filename(file.filename, fallback="upload.bin")
+    extension = Path(original_filename).suffix.lower()
+    if extension not in ALLOWED_INPUT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+
+    try:
+        normalized_key = validate_numeric_key(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    youtube_status = youtube_service.session_status()
+    if not youtube_status.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Save a YouTube client ID and client secret first.",
+        )
+    if not youtube_status.connected:
+        raise HTTPException(status_code=409, detail="Connect YouTube before uploading files.")
+
+    content = await file.read(MAX_UPLOAD_SIZE + 1)
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit.")
+
+    media_type = file.content_type or guess_media_type(original_filename)
+    job = jobs.create("youtube_upload")
+    source_path = _write_upload(job.job_id, content, original_filename)
+    background_tasks.add_task(
+        _run_remote_upload_job,
+        job.job_id,
+        source_path,
+        original_filename,
+        media_type,
+        normalized_key,
+    )
+    return {"job_id": job.job_id, "status": job.status}
+
+
+@app.post("/api/files/{video_id}/download")
+async def start_remote_download(
+    video_id: str,
+    background_tasks: BackgroundTasks,
+    key: str = Form(...),
+) -> dict[str, str]:
+    try:
+        normalized_key = validate_numeric_key(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    youtube_status = youtube_service.session_status()
+    if not youtube_status.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Save a YouTube client ID and client secret first.",
+        )
+    if not youtube_status.connected:
+        raise HTTPException(status_code=409, detail="Connect YouTube before downloading files.")
+
+    job = jobs.create("youtube_download")
+    background_tasks.add_task(_run_remote_download_job, job.job_id, video_id, normalized_key)
+    return {"job_id": job.job_id, "status": job.status}
+
+
+@app.post("/api/encode")
+async def start_encode(background_tasks: BackgroundTasks, file: UploadFile = File(...), key: str = Form(...)) -> dict[str, str]:
+    original_filename = sanitize_filename(file.filename, fallback="upload.bin")
+    extension = Path(original_filename).suffix.lower()
+    if extension not in ALLOWED_INPUT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+    try:
+        normalized_key = validate_numeric_key(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    content = await file.read(MAX_UPLOAD_SIZE + 1)
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="File exceeds the 10 MB limit.")
+
+    job = jobs.create("encode")
+    source_path = _write_upload(job.job_id, content, original_filename)
+    media_type = file.content_type or guess_media_type(original_filename)
+    background_tasks.add_task(_run_encode_job, job.job_id, source_path, original_filename, media_type, normalized_key)
+    return {"job_id": job.job_id, "status": job.status}
+
+
+@app.post("/api/decode")
+async def start_decode(background_tasks: BackgroundTasks, file: UploadFile = File(...), key: str = Form(...)) -> dict[str, str]:
+    original_filename = sanitize_filename(file.filename, fallback="video.webm")
+    extension = Path(original_filename).suffix.lower()
+    if extension not in ALLOWED_DECODE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only .webm files generated by this app can be decoded.")
+    try:
+        normalized_key = validate_numeric_key(key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    content = await file.read(MAX_DECODE_UPLOAD_SIZE + 1)
+    if len(content) > MAX_DECODE_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="Video exceeds the decode upload limit.")
+
+    job = jobs.create("decode")
+    source_path = _write_upload(job.job_id, content, original_filename)
+    background_tasks.add_task(_run_decode_job, job.job_id, source_path, normalized_key)
+    return {"job_id": job.job_id, "status": job.status}
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(request: Request, job_id: str) -> dict[str, Any]:
+    try:
+        job = jobs.snapshot(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Job not found.") from exc
+    return _serialize_job(request, job)
+
+
+@app.get("/api/artifacts/{job_id}/{artifact_path:path}", name="artifact_file")
+async def get_artifact(job_id: str, artifact_path: str) -> FileResponse:
+    job_dir = (JOBS_DIR / job_id).resolve()
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    candidate = (job_dir / artifact_path).resolve()
+    try:
+        candidate.relative_to(job_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid artifact path.") from exc
+
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+
+    media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+    return FileResponse(candidate, media_type=media_type)
+
+
+def _run_remote_upload_job(job_id: str, source_path: Path, original_filename: str, media_type: str, key: str) -> None:
+    from .codec.service import CodecError, encode_file
+    from .codec.video import encode_frames_to_youtube_mp4
+
+    job_dir = JOBS_DIR / job_id
+    jobs.update(job_id, status="running", progress=1, message="Preparing encrypted upload.")
+
+    try:
+        result = encode_file(
+            source_path=source_path,
+            original_filename=original_filename,
+            media_type=media_type,
+            key=key,
+            job_dir=job_dir,
+            progress=lambda progress, message: jobs.update(
+                job_id,
+                status="running",
+                progress=_scaled_progress(progress, start=4, end=79),
+                message=message,
+            ),
+        )
+        youtube_video_path = job_dir / YOUTUBE_VIDEO_NAME
+        jobs.update(job_id, status="running", progress=80, message="Preparing YouTube-compatible video.")
+        encode_frames_to_youtube_mp4(
+            frames_dir=job_dir / "frames",
+            output_path=youtube_video_path,
+            fps=int(result.manifest["fps"]),
+            frame_count=len(result.frame_paths),
+        )
+        remote_file = youtube_service.upload_video(
+            video_path=youtube_video_path,
+            manifest=result.manifest,
+            progress=lambda progress, message: jobs.update(
+                job_id,
+                status="running",
+                progress=progress,
+                message=message,
+            ),
+        )
+    except CodecError as exc:
+        jobs.update(job_id, status="failed", error=str(exc), message="Upload failed.")
+        return
+    except YouTubeError as exc:
+        jobs.update(job_id, status="failed", error=str(exc), message="Upload failed.")
+        return
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        jobs.update(job_id, status="failed", error=f"Unexpected error: {exc}", message="Upload failed.")
+        return
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+    manifest = result.manifest
+    remote_payload = remote_file.to_dict()
+    jobs.update(
+        job_id,
+        status="completed",
+        progress=100,
+        message="Uploaded encrypted video to YouTube.",
+        metadata={
+            "original_filename": manifest["original_filename"],
+            "media_type": manifest["media_type"],
+            "original_size": manifest["original_size"],
+            "stored_size": manifest["stored_size"],
+            "sha256": manifest["sha256"],
+            "crc32": manifest["crc32"],
+            "frame_count": manifest["total_frames"],
+            "fps": manifest["fps"],
+            "privacy_status": remote_file.privacy_status,
+            "remote_file": remote_payload,
+        },
+        artifacts={
+            "youtube_watch": remote_file.watch_url,
+            "youtube_studio": remote_file.studio_url,
+        },
+    )
+
+
+def _run_remote_download_job(job_id: str, video_id: str, key: str) -> None:
+    from .codec.service import CodecError, decode_video
+
+    job_dir = JOBS_DIR / job_id
+    jobs.update(job_id, status="running", progress=2, message="Locating file in YouTube library.")
+
+    try:
+        remote_file = youtube_service.get_file(video_id)
+        source_dir = job_dir / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        jobs.update(job_id, status="running", progress=15, message="Downloading video from YouTube.")
+        downloaded_video_path = youtube_service.download_video(video_id=video_id, output_dir=source_dir)
+        result = decode_video(
+            video_path=downloaded_video_path,
+            job_dir=job_dir,
+            key=key,
+            allow_duplicate_frame_chunks=True,
+            progress=lambda progress, message: jobs.update(
+                job_id,
+                status="running",
+                progress=_scaled_progress(progress, start=35, end=99),
+                message=message,
+            ),
+        )
+    except CodecError as exc:
+        jobs.update(job_id, status="failed", error=str(exc), message="Download failed.")
+        return
+    except YouTubeError as exc:
+        jobs.update(job_id, status="failed", error=str(exc), message="Download failed.")
+        return
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        jobs.update(job_id, status="failed", error=f"Unexpected error: {exc}", message="Download failed.")
+        return
+
+    manifest = result.manifest
+    jobs.update(
+        job_id,
+        status="completed",
+        progress=100,
+        message="Recovered original file from YouTube."
+        if result.integrity_ok
+        else "Recovered file from YouTube, but integrity validation failed.",
+        metadata={
+            "original_filename": manifest["original_filename"],
+            "media_type": manifest["media_type"],
+            "original_size": manifest["original_size"],
+            "compressed": manifest["compressed"],
+            "sha256": manifest["sha256"],
+            "crc32": manifest["crc32"],
+            "frame_count": manifest["total_frames"],
+            "fps": manifest["fps"],
+            "integrity_ok": result.integrity_ok,
+            "remote_file": remote_file.to_dict(),
+        },
+        artifacts={
+            "recovered_file": str(result.restored_path.relative_to(job_dir)),
+            "manifest": str(result.manifest_path.relative_to(job_dir)),
+        },
+    )
+
+
+def _run_encode_job(job_id: str, source_path: Path, original_filename: str, media_type: str, key: str) -> None:
+    from .codec.service import CodecError, encode_file
+
+    jobs.update(job_id, status="running", progress=1, message="Starting encode.")
+    job_dir = JOBS_DIR / job_id
+
+    try:
+        result = encode_file(
+            source_path=source_path,
+            original_filename=original_filename,
+            media_type=media_type,
+            key=key,
+            job_dir=job_dir,
+            progress=lambda progress, message: jobs.update(
+                job_id,
+                status="running",
+                progress=progress,
+                message=message,
+            ),
+        )
+    except CodecError as exc:
+        jobs.update(job_id, status="failed", error=str(exc), message="Encode failed.")
+        return
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        jobs.update(job_id, status="failed", error=f"Unexpected error: {exc}", message="Encode failed.")
+        return
+
+    frame_files = [str(path.relative_to(job_dir)) for path in result.frame_paths]
+    manifest = result.manifest
+    jobs.update(
+        job_id,
+        status="completed",
+        progress=100,
+        message="Encode complete.",
+        metadata={
+            "original_filename": manifest["original_filename"],
+            "media_type": manifest["media_type"],
+            "original_size": manifest["original_size"],
+            "stored_size": manifest["stored_size"],
+            "compressed": manifest["compressed"],
+            "sha256": manifest["sha256"],
+            "crc32": manifest["crc32"],
+            "frame_count": manifest["total_frames"],
+            "fps": manifest["fps"],
+            "duration_seconds": round(int(manifest["total_frames"]) / int(manifest["fps"]), 2),
+            "frame_files": frame_files,
+        },
+        artifacts={
+            "video": str(result.video_path.relative_to(job_dir)),
+            "frames_zip": str(result.frames_zip_path.relative_to(job_dir)),
+            "manifest": str(result.manifest_path.relative_to(job_dir)),
+        },
+    )
+
+
+def _run_decode_job(job_id: str, source_path: Path, key: str) -> None:
+    from .codec.service import CodecError, decode_video
+
+    jobs.update(job_id, status="running", progress=1, message="Starting decode.")
+    job_dir = JOBS_DIR / job_id
+
+    try:
+        result = decode_video(
+            video_path=source_path,
+            job_dir=job_dir,
+            key=key,
+            progress=lambda progress, message: jobs.update(
+                job_id,
+                status="running",
+                progress=progress,
+                message=message,
+            ),
+        )
+    except CodecError as exc:
+        jobs.update(job_id, status="failed", error=str(exc), message="Decode failed.")
+        return
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        jobs.update(job_id, status="failed", error=f"Unexpected error: {exc}", message="Decode failed.")
+        return
+
+    manifest = result.manifest
+    jobs.update(
+        job_id,
+        status="completed",
+        progress=100,
+        message="Decode complete." if result.integrity_ok else "Decode complete, but integrity validation failed.",
+        metadata={
+            "original_filename": manifest["original_filename"],
+            "media_type": manifest["media_type"],
+            "original_size": manifest["original_size"],
+            "compressed": manifest["compressed"],
+            "sha256": manifest["sha256"],
+            "crc32": manifest["crc32"],
+            "frame_count": manifest["total_frames"],
+            "fps": manifest["fps"],
+            "integrity_ok": result.integrity_ok,
+        },
+        artifacts={
+            "recovered_file": str(result.restored_path.relative_to(job_dir)),
+            "manifest": str(result.manifest_path.relative_to(job_dir)),
+        },
+    )
+
+
+def _write_upload(job_id: str, content: bytes, original_filename: str) -> Path:
+    job_dir = JOBS_DIR / job_id
+    source_dir = job_dir / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_name = sanitize_filename(original_filename)
+    source_path = source_dir / source_name
+    source_path.write_bytes(content)
+    return source_path
+
+
+def _serialize_job(request: Request, job: JobRecord) -> dict[str, Any]:
+    payload = asdict(job)
+    payload["created_at"] = int(job.created_at)
+    payload["updated_at"] = int(job.updated_at)
+    payload["artifacts"] = {
+        name: _artifact_url(request, job.job_id, artifact_path)
+        for name, artifact_path in job.artifacts.items()
+    }
+
+    frame_files = job.metadata.get("frame_files")
+    if isinstance(frame_files, list):
+        payload["metadata"]["frame_files"] = [
+            {
+                "index": index + 1,
+                "name": Path(relative_path).name,
+                "url": str(request.url_for("artifact_file", job_id=job.job_id, artifact_path=relative_path)),
+            }
+            for index, relative_path in enumerate(frame_files)
+        ]
+
+    return payload
+
+
+def _artifact_url(request: Request, job_id: str, artifact_path: Any) -> Any:
+    if not isinstance(artifact_path, str):
+        return artifact_path
+    if artifact_path.startswith(("http://", "https://")):
+        return artifact_path
+    return str(request.url_for("artifact_file", job_id=job_id, artifact_path=artifact_path))
+
+
+def _scaled_progress(progress: int, *, start: int, end: int) -> int:
+    clamped = max(0, min(100, progress))
+    return start + round(((end - start) * clamped) / 100)
+
+
+def _cleanup_expired_jobs() -> None:
+    now = time.time()
+    for job_dir in JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        age = now - job_dir.stat().st_mtime
+        if age > JOB_TTL_SECONDS:
+            shutil.rmtree(job_dir, ignore_errors=True)

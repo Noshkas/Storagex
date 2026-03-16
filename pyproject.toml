@@ -1,0 +1,31 @@
+[project]
+name = "storagex"
+version = "0.1.0"
+description = "Experimental local-first encrypted file storage backed by reversible YouTube uploads"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "fastapi>=0.116.0",
+  "google-api-python-client>=2.169.0",
+  "google-auth-httplib2>=0.2.0",
+  "google-auth-oauthlib>=1.2.2",
+  "httpx>=0.28.0",
+  "imageio-ffmpeg>=0.6.0",
+  "numpy>=2.3.0",
+  "pillow>=11.3.0",
+  "python-multipart>=0.0.20",
+  "uvicorn>=0.35.0",
+  "yt-dlp>=2025.10.22",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+package = false

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from fastapi import UploadFile
 from fastapi.testclient import TestClient
 
 import server.app as server_app
+from server.codec.constants import LEGACY_FORMAT_VERSION
+from server.codec.format import build_stream_with_manifest
+from server.codec.keyed import scramble_payload
+from server.codec.service import _render_frame_grid, _write_frame_png
+from server.codec.video import encode_frames_to_webm
 from server.youtube import (
     InMemoryYouTubeStore,
     YouTubeAuthError,
@@ -180,7 +188,9 @@ def test_api_encode_then_decode_flow(isolated_jobs_dir) -> None:
         assert response.status_code == 200
         encode_job = _wait_for_completion(client, response.json()["job_id"])
         assert encode_job["status"] == "completed"
-        assert encode_job["artifacts"]["video"].endswith(".webm")
+        assert encode_job["artifacts"]["video"].endswith(".mkv")
+        assert "frames_zip" not in encode_job["artifacts"]
+        assert "frame_files" not in encode_job["metadata"]
 
         video_response = client.get(encode_job["artifacts"]["video"])
         assert video_response.status_code == 200
@@ -188,7 +198,7 @@ def test_api_encode_then_decode_flow(isolated_jobs_dir) -> None:
 
         decode_response = client.post(
             "/api/decode",
-            files={"file": ("encoded.webm", video_response.content, "video/webm")},
+            files={"file": ("encoded.mkv", video_response.content, "video/x-matroska")},
             data={"key": VALID_KEY},
         )
         assert decode_response.status_code == 200
@@ -217,7 +227,7 @@ def test_api_decode_with_wrong_key_downloads_corrupted_file(isolated_jobs_dir) -
 
         decode_response = client.post(
             "/api/decode",
-            files={"file": ("encoded.webm", video_response.content, "video/webm")},
+            files={"file": ("encoded.mkv", video_response.content, "video/x-matroska")},
             data={"key": WRONG_KEY},
         )
         assert decode_response.status_code == 200
@@ -231,26 +241,73 @@ def test_api_decode_with_wrong_key_downloads_corrupted_file(isolated_jobs_dir) -
         assert recovered_response.content != source_bytes
 
 
-def test_api_rejects_unsupported_upload_type(isolated_jobs_dir) -> None:
+def test_api_decode_accepts_legacy_webm_upload(isolated_jobs_dir) -> None:
+    with TestClient(server_app.app) as client:
+        legacy_video = _build_legacy_webm_archive(isolated_jobs_dir, filename="legacy.txt", payload=b"legacy payload\n" * 64)
+        decode_response = client.post(
+            "/api/decode",
+            files={"file": ("encoded.webm", legacy_video.read_bytes(), "video/webm")},
+            data={"key": VALID_KEY},
+        )
+        assert decode_response.status_code == 200
+        decode_job = _wait_for_completion(client, decode_response.json()["job_id"])
+        assert decode_job["status"] == "completed"
+        assert decode_job["metadata"]["integrity_ok"] is True
+
+        recovered_response = client.get(decode_job["artifacts"]["recovered_file"])
+        assert recovered_response.status_code == 200
+        assert recovered_response.content == b"legacy payload\n" * 64
+
+
+def test_api_accepts_office_document_upload_type(isolated_jobs_dir) -> None:
     with TestClient(server_app.app) as client:
         response = client.post(
             "/api/encode",
-            files={"file": ("notes.docx", b"not supported", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+            files={"file": ("slides.pptx", b"office payload", "application/vnd.openxmlformats-officedocument.presentationml.presentation")},
             data={"key": VALID_KEY},
         )
-        assert response.status_code == 400
-        assert response.json()["detail"] == "Unsupported file type."
+        assert response.status_code == 200
+        encode_job = _wait_for_completion(client, response.json()["job_id"])
+        assert encode_job["status"] == "completed"
+        assert encode_job["metadata"]["original_filename"] == "slides.pptx"
 
 
-def test_api_rejects_oversize_upload(isolated_jobs_dir) -> None:
+def test_api_encode_debug_artifacts_are_opt_in(isolated_jobs_dir) -> None:
     with TestClient(server_app.app) as client:
-        response = client.post(
+        default_response = client.post(
             "/api/encode",
-            files={"file": ("big.txt", b"x" * ((10 * 1024 * 1024) + 1), "text/plain")},
+            files={"file": ("hello.txt", b"hello from storagex\n" * 64, "text/plain")},
             data={"key": VALID_KEY},
         )
-        assert response.status_code == 413
-        assert response.json()["detail"] == "File exceeds the 10 MB limit."
+        assert default_response.status_code == 200
+        default_job = _wait_for_completion(client, default_response.json()["job_id"])
+        assert default_job["status"] == "completed"
+        assert "frames_zip" not in default_job["artifacts"]
+        assert "frame_files" not in default_job["metadata"]
+
+        debug_response = client.post(
+            "/api/encode",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 64, "text/plain")},
+            data={"key": VALID_KEY, "debug_artifacts": "true"},
+        )
+        assert debug_response.status_code == 200
+        debug_job = _wait_for_completion(client, debug_response.json()["job_id"])
+        assert debug_job["status"] == "completed"
+        assert debug_job["artifacts"]["frames_zip"].endswith(".zip")
+        assert debug_job["metadata"]["frame_files"]
+
+
+def test_write_incoming_upload_allows_payloads_above_previous_limit(isolated_jobs_dir) -> None:
+    upload = UploadFile(
+        filename="deck.pptx",
+        file=io.BytesIO(b"x" * ((10 * 1024 * 1024) + 1)),
+        headers={"content-type": "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+    )
+
+    source_path = asyncio.run(server_app._write_incoming_upload("job-large", upload, "deck.pptx"))
+
+    assert source_path.name == "deck.pptx"
+    assert source_path.stat().st_size == (10 * 1024 * 1024) + 1
 
 
 def test_api_rejects_invalid_key(isolated_jobs_dir) -> None:
@@ -610,6 +667,28 @@ def _wait_for_completion(client: TestClient, job_id: str, timeout: float = 30.0)
             return payload
         time.sleep(0.1)
     raise AssertionError(f"Job {job_id} did not finish in time.")
+
+
+def _build_legacy_webm_archive(root: Path, *, filename: str, payload: bytes) -> Path:
+    protected = scramble_payload(payload, VALID_KEY)
+    manifest, _, chunks = build_stream_with_manifest(
+        original_filename=filename,
+        media_type="text/plain",
+        original_bytes=payload,
+        stored_bytes=protected,
+        version=LEGACY_FORMAT_VERSION,
+    )
+
+    frames_dir = root / f"legacy-frames-{filename}"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    for index, chunk in enumerate(chunks):
+        frame_path = frames_dir / f"frame_{index + 1:06d}.png"
+        _write_frame_png(_render_frame_grid(frame_index=index, chunk=chunk), frame_path)
+
+    video_path = root / f"{Path(filename).stem}.webm"
+    encode_frames_to_webm(frames_dir, video_path)
+    assert manifest["version"] == LEGACY_FORMAT_VERSION
+    return video_path
 
 
 def _youtube_file(*, video_id: str, original_filename: str) -> YouTubeFileRecord:

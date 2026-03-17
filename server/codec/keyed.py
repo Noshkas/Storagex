@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import re
+from typing import BinaryIO, Iterator
+
+import numpy as np
+
+from .constants import KEY_CHUNK_BYTES
 
 KEY_LENGTH = 24
 KEY_PATTERN = re.compile(r"^\d{24}$")
 MASK64 = (1 << 64) - 1
+LEGACY_KEY_MODE = "custom24-scramble"
+STREAM_KEY_MODE = "custom24-shake256-chunk-xor"
 
 
 def validate_numeric_key(key: str) -> str:
@@ -51,6 +59,48 @@ def unscramble_payload(payload: bytes, key: str) -> bytes:
     )
     keystream = _keystream(_derive_seed(digits), len(unrotated))
     return bytes(byte ^ keystream[index] for index, byte in enumerate(unrotated))
+
+
+def stream_payload_transform(source: BinaryIO, *, key: str, chunk_size: int = KEY_CHUNK_BYTES) -> Iterator[bytes]:
+    normalized_key = validate_numeric_key(key)
+    seed = _stream_seed(normalized_key)
+    chunk_index = 0
+    while True:
+        chunk = source.read(chunk_size)
+        if not chunk:
+            break
+        yield transform_payload_chunk(chunk, seed=seed, chunk_index=chunk_index)
+        chunk_index += 1
+
+
+def transform_payload_chunk(chunk: bytes, *, seed: bytes, chunk_index: int) -> bytes:
+    if not chunk:
+        return b""
+    keystream = hashlib.shake_256(seed + chunk_index.to_bytes(8, "little")).digest(len(chunk))
+    transformed = np.bitwise_xor(
+        np.frombuffer(chunk, dtype=np.uint8),
+        np.frombuffer(keystream, dtype=np.uint8),
+    )
+    return transformed.tobytes()
+
+
+def stream_payload_transform_to_file(
+    source: BinaryIO,
+    target: BinaryIO,
+    *,
+    key: str,
+    chunk_size: int = KEY_CHUNK_BYTES,
+) -> int:
+    total_bytes = 0
+    for chunk in stream_payload_transform(source, key=key, chunk_size=chunk_size):
+        target.write(chunk)
+        total_bytes += len(chunk)
+    return total_bytes
+
+
+def _stream_seed(key: str) -> bytes:
+    normalized_key = validate_numeric_key(key)
+    return hashlib.sha256(normalized_key.encode("ascii")).digest()
 
 
 def _digits(key: str) -> list[int]:

@@ -10,9 +10,18 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from server.codec.constants import CELL_SIZE, QUIET_MARGIN
-from server.codec.format import LAYOUT, assemble_stream, bits_to_bytes, build_stream_with_manifest, bytes_to_bits, chunk_stream
-from server.codec.keyed import scramble_payload, unscramble_payload, validate_numeric_key
+from server.codec.constants import CELL_SIZE, FORMAT_VERSION, KEY_CHUNK_BYTES, LEGACY_FORMAT_VERSION, QUIET_MARGIN
+from server.codec.format import (
+    LAYOUT,
+    assemble_stream,
+    bits_to_bytes,
+    build_manifest_for_payload,
+    build_stream_with_manifest,
+    bytes_to_bits,
+    chunk_stream,
+    validate_manifest,
+)
+from server.codec.keyed import LEGACY_KEY_MODE, STREAM_KEY_MODE, scramble_payload, stream_payload_transform, unscramble_payload, validate_numeric_key
 from server.codec.service import CodecError, _render_frame_grid, _write_frame_png, decode_video, decode_video_from_frames, encode_file
 from server.codec.video import encode_frames_to_webm, encode_frames_to_youtube_mp4
 
@@ -74,6 +83,13 @@ def test_scramble_round_trip() -> None:
     assert unscramble_payload(scrambled, VALID_KEY) == payload
 
 
+def test_stream_payload_transform_round_trip() -> None:
+    payload = _multi_frame_payload() + b"stream-end"
+    transformed = b"".join(stream_payload_transform(BytesIO(payload), key=VALID_KEY))
+    assert transformed != payload
+    assert b"".join(stream_payload_transform(BytesIO(transformed), key=VALID_KEY)) == payload
+
+
 def test_different_keys_produce_different_scrambled_payloads() -> None:
     payload = b"storagex-keyed-video" * 50
     assert scramble_payload(payload, VALID_KEY) != scramble_payload(payload, WRONG_KEY)
@@ -85,13 +101,30 @@ def test_manifest_total_frames_is_stable() -> None:
         original_filename="example.txt",
         media_type="text/plain",
         original_bytes=payload,
-        stored_bytes=scramble_payload(payload, VALID_KEY),
+        stored_bytes=b"".join(stream_payload_transform(BytesIO(payload), key=VALID_KEY)),
     )
+    assert manifest["version"] == FORMAT_VERSION
+    assert manifest["key_mode"] == STREAM_KEY_MODE
+    assert manifest["key_chunk_bytes"] == KEY_CHUNK_BYTES
     assert manifest["total_frames"] == len(chunks)
     assert manifest["compressed"] is False
     assert manifest["keyed"] is True
     assert manifest["key_length"] == 24
     assert VALID_KEY not in json.dumps(manifest, sort_keys=True)
+
+
+def test_validate_manifest_rejects_wrong_v3_chunk_size() -> None:
+    manifest = build_manifest_for_payload(
+        original_filename="example.txt",
+        media_type="text/plain",
+        original_size=128,
+        stored_size=128,
+        sha256="0" * 64,
+        crc32="0" * 8,
+    )
+    manifest["key_chunk_bytes"] = 2048
+    with pytest.raises(ValueError, match="Unexpected keyed chunk size"):
+        validate_manifest(manifest)
 
 
 @pytest.mark.parametrize(
@@ -120,6 +153,9 @@ def test_round_trip_supported_types(tmp_path: Path, filename: str, payload: byte
     decoded = decode_video(video_path=encoded.video_path, job_dir=decode_dir, key=VALID_KEY)
 
     recovered = decoded.restored_path.read_bytes()
+    assert encoded.video_path.suffix == ".mkv"
+    assert encoded.manifest["version"] == FORMAT_VERSION
+    assert encoded.manifest["key_mode"] == STREAM_KEY_MODE
     assert recovered == payload
     assert hashlib.sha256(recovered).hexdigest() == decoded.manifest["sha256"]
     assert decoded.integrity_ok is True
@@ -143,6 +179,35 @@ def test_wrong_key_download_stays_same_length_but_fails_integrity(tmp_path: Path
     assert decoded.integrity_ok is False
     assert len(recovered) == len(payload)
     assert recovered != payload
+
+
+def test_decode_accepts_legacy_v2_webm(tmp_path: Path) -> None:
+    payload = _multi_frame_payload() + b"legacy-data"
+    source_path = tmp_path / "legacy.txt"
+    source_path.write_bytes(payload)
+
+    protected = scramble_payload(payload, VALID_KEY)
+    manifest, _, chunks = build_stream_with_manifest(
+        original_filename="legacy.txt",
+        media_type="text/plain",
+        original_bytes=payload,
+        stored_bytes=protected,
+        version=LEGACY_FORMAT_VERSION,
+    )
+    assert manifest["key_mode"] == LEGACY_KEY_MODE
+
+    frames_dir = tmp_path / "legacy-frames"
+    frames_dir.mkdir()
+    for index, chunk in enumerate(chunks):
+        frame_path = frames_dir / f"frame_{index + 1:06d}.png"
+        _write_frame_png(_render_frame_grid(frame_index=index, chunk=chunk), frame_path)
+
+    video_path = tmp_path / "legacy.webm"
+    encode_frames_to_webm(frames_dir, video_path)
+
+    decoded = decode_video(video_path=video_path, job_dir=tmp_path / "decode", key=VALID_KEY)
+    assert decoded.integrity_ok is True
+    assert decoded.restored_path.read_bytes() == payload
 
 
 def test_decode_rejects_modified_finder_pattern(tmp_path: Path) -> None:
@@ -258,6 +323,7 @@ def test_decode_accepts_identical_duplicate_frames_for_youtube_recovery(tmp_path
         media_type="text/plain",
         key=VALID_KEY,
         job_dir=tmp_path / "encode",
+        debug_artifacts=True,
     )
 
     youtube_video_path = tmp_path / "encode" / "output" / "youtube-upload.mp4"
@@ -282,7 +348,7 @@ def test_decode_accepts_identical_duplicate_frames_for_youtube_recovery(tmp_path
 
 def test_decode_rejects_version_one_video(tmp_path: Path) -> None:
     payload = b"legacy-video" * 400
-    protected = scramble_payload(payload, VALID_KEY)
+    protected = b"".join(stream_payload_transform(BytesIO(payload), key=VALID_KEY))
     manifest, _, _ = build_stream_with_manifest(
         original_filename="legacy.txt",
         media_type="text/plain",
@@ -339,6 +405,7 @@ def _encode_to_frames(tmp_path: Path, payload: bytes) -> Path:
         media_type="text/plain",
         key=VALID_KEY,
         job_dir=job_dir,
+        debug_artifacts=True,
     )
     return job_dir / "frames"
 

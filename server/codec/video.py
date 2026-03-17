@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import math
 import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
-from .constants import FPS
+from .constants import FPS, FRAME_HEIGHT, FRAME_WIDTH
 
 ProgressCallback = Callable[[int, str], None]
 FRAME_PROGRESS_PATTERN = re.compile(r"frame=\s*(\d+)")
 YOUTUBE_MIN_DURATION_SECONDS = 5
+RAW_FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT
 
 
 @dataclass(slots=True)
@@ -74,8 +74,7 @@ def encode_frames_to_youtube_mp4(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frame_pattern = str(frames_dir / "frame_%06d.png")
     effective_frame_count = frame_count if frame_count is not None else len(list(frames_dir.glob("frame_*.png")))
-    current_duration = (effective_frame_count / fps) if effective_frame_count and fps > 0 else 0
-    pad_duration = max(0.0, float(min_duration_seconds) - current_duration)
+    pad_duration = _pad_duration(frame_count=effective_frame_count, fps=fps, min_duration_seconds=min_duration_seconds)
     filter_parts = []
     if pad_duration > 0:
         filter_parts.append(f"tpad=stop_mode=clone:stop_duration={pad_duration:.3f}")
@@ -118,6 +117,171 @@ def encode_frames_to_youtube_mp4(
     _run_ffmpeg(command, "Failed to encode the PNG frame sequence into a YouTube-compatible MP4.")
 
 
+def encode_raw_frames_to_mkv(frame_source: Iterable[bytes], output_path: Path, *, fps: int = FPS) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg_executable(),
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-video_size",
+        f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
+        "-framerate",
+        str(fps),
+        "-i",
+        "pipe:0",
+        "-c:v",
+        "ffv1",
+        "-level",
+        "3",
+        "-pix_fmt",
+        "gray",
+        str(output_path),
+    ]
+    _run_raw_frame_encoder(
+        frame_source,
+        command=command,
+        error_message="Failed to encode the raw frame sequence into Matroska.",
+    )
+
+
+def encode_raw_frames_to_youtube_mp4(
+    frame_source: Iterable[bytes],
+    output_path: Path,
+    *,
+    fps: int = FPS,
+    frame_count: int,
+    min_duration_seconds: int = YOUTUBE_MIN_DURATION_SECONDS,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pad_duration = _pad_duration(frame_count=frame_count, fps=fps, min_duration_seconds=min_duration_seconds)
+    filter_parts = []
+    if pad_duration > 0:
+        filter_parts.append(f"tpad=stop_mode=clone:stop_duration={pad_duration:.3f}")
+    filter_parts.append("format=yuv420p")
+
+    command = [
+        ffmpeg_executable(),
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-video_size",
+        f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
+        "-framerate",
+        str(fps),
+        "-i",
+        "pipe:0",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-vf",
+        ",".join(filter_parts),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.0",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    _run_raw_frame_encoder(
+        frame_source,
+        command=command,
+        error_message="Failed to encode the raw frame sequence into a YouTube-compatible MP4.",
+    )
+
+
+def stream_video_frames(
+    video_path: Path,
+    *,
+    frame_handler: Callable[[bytes, int], None],
+    progress: ProgressCallback | None = None,
+) -> ExtractionResult:
+    command = [
+        ffmpeg_executable(),
+        "-y",
+        "-loglevel",
+        "error",
+        "-err_detect",
+        "ignore_err",
+        "-fflags",
+        "+discardcorrupt",
+        "-i",
+        str(video_path),
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "pipe:1",
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    extracted_frames = 0
+    partial_warning = False
+    try:
+        while True:
+            frame_bytes = _read_exact(process.stdout, RAW_FRAME_SIZE)
+            if frame_bytes is None:
+                break
+            if len(frame_bytes) != RAW_FRAME_SIZE:
+                partial_warning = True
+                break
+
+            extracted_frames += 1
+            frame_handler(frame_bytes, extracted_frames)
+            if progress is not None:
+                progress_value = min(54, 5 + min(extracted_frames, 49))
+                progress(progress_value, f"Extracted frame {extracted_frames}.")
+    except Exception:
+        process.kill()
+        process.wait()
+        raise
+
+    stderr_output = process.stderr.read().decode("utf-8", errors="replace")
+    return_code = process.wait()
+    warning = stderr_output.strip() or None
+    if partial_warning and warning is None:
+        warning = "ffmpeg returned a partial trailing frame while decoding the uploaded video."
+
+    if extracted_frames == 0:
+        raise RuntimeError(f"Failed to extract frames from the uploaded video. {stderr_output.strip()}".strip())
+    if return_code != 0 and warning is None:
+        warning = "ffmpeg reported a non-clean exit after decoding the uploaded video."
+
+    return ExtractionResult(extracted_frames=extracted_frames, warning=warning)
+
+
 def extract_video_frames(
     video_path: Path,
     output_dir: Path,
@@ -148,7 +312,7 @@ def extract_video_frames(
     ]
     completed = _run_ffmpeg(
         command,
-        "Failed to extract frames from the uploaded WebM.",
+        "Failed to extract frames from the uploaded video.",
         progress=_frame_progress_callback(
             progress=progress,
             progress_start=5,
@@ -162,7 +326,7 @@ def extract_video_frames(
     extracted_frames = len(list(output_dir.glob("frame_*.png")))
     if extracted_frames == 0:
         stderr = completed.stderr.strip()
-        raise RuntimeError(f"Failed to extract frames from the uploaded WebM. {stderr}".strip())
+        raise RuntimeError(f"Failed to extract frames from the uploaded video. {stderr}".strip())
 
     warning = None
     if completed.returncode != 0:
@@ -172,6 +336,54 @@ def extract_video_frames(
         extracted_frames=extracted_frames,
         warning=warning,
     )
+
+
+def _run_raw_frame_encoder(
+    frame_source: Iterable[bytes],
+    *,
+    command: list[str],
+    error_message: str,
+) -> None:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    assert process.stderr is not None
+
+    try:
+        for frame_bytes in frame_source:
+            process.stdin.write(frame_bytes)
+        process.stdin.close()
+        stderr_output = process.stderr.read().decode("utf-8", errors="replace")
+        return_code = process.wait()
+    except Exception:
+        process.kill()
+        process.wait()
+        raise
+
+    if return_code != 0:
+        raise RuntimeError(f"{error_message} {stderr_output.strip()}".strip())
+
+
+def _read_exact(handle, size: int) -> bytes | None:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = handle.read(size - len(chunks))
+        if not chunk:
+            if not chunks:
+                return None
+            return bytes(chunks)
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _pad_duration(*, frame_count: int | None, fps: int, min_duration_seconds: int) -> float:
+    effective_frame_count = frame_count or 0
+    current_duration = (effective_frame_count / fps) if effective_frame_count and fps > 0 else 0
+    return max(0.0, float(min_duration_seconds) - current_duration)
 
 
 def _run_ffmpeg(
@@ -208,9 +420,6 @@ def _run_ffmpeg(
     for raw_line in process.stdout:
         line = raw_line.rstrip()
         stdout_lines.append(line)
-        if progress is None:
-            continue
-
         match = FRAME_PROGRESS_PATTERN.search(line)
         if match:
             progress(int(match.group(1)))

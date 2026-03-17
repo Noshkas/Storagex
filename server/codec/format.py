@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import mimetypes
 import re
 import struct
@@ -22,10 +23,12 @@ from .constants import (
     FRAME_WIDTH,
     GRID_COLS,
     GRID_ROWS,
+    KEY_CHUNK_BYTES,
+    LEGACY_FORMAT_VERSION,
     QUIET_MARGIN,
     TIMING_INDEX,
 )
-from .keyed import KEY_LENGTH
+from .keyed import KEY_LENGTH, LEGACY_KEY_MODE, STREAM_KEY_MODE
 
 FRAME_HEADER_STRUCT = struct.Struct("<4sIII")
 STREAM_HEADER_STRUCT = struct.Struct("<I")
@@ -138,28 +141,30 @@ def guess_media_type(filename: str, fallback: str = "application/octet-stream") 
     return guessed or fallback
 
 
-def build_manifest(
+def build_manifest_from_stats(
     *,
     original_filename: str,
     media_type: str,
-    original_bytes: bytes,
-    stored_bytes: bytes,
+    original_size: int,
+    stored_size: int,
     total_frames: int,
+    sha256: str,
+    crc32: str,
+    version: int = FORMAT_VERSION,
 ) -> dict[str, int | str | bool]:
-    return {
+    manifest: dict[str, int | str | bool] = {
         "magic": APP_MAGIC,
-        "version": FORMAT_VERSION,
+        "version": version,
         "original_filename": sanitize_filename(original_filename),
         "media_type": media_type or guess_media_type(original_filename),
-        "original_size": len(original_bytes),
-        "stored_size": len(stored_bytes),
+        "original_size": original_size,
+        "stored_size": stored_size,
         "compressed": False,
         "keyed": True,
         "key_length": KEY_LENGTH,
-        "key_mode": "custom24-scramble",
         "protected_scope": "payload",
-        "sha256": hashlib.sha256(original_bytes).hexdigest(),
-        "crc32": f"{zlib.crc32(original_bytes) & 0xFFFFFFFF:08x}",
+        "sha256": sha256,
+        "crc32": crc32,
         "frame_width": FRAME_WIDTH,
         "frame_height": FRAME_HEIGHT,
         "cell_size": CELL_SIZE,
@@ -172,15 +177,48 @@ def build_manifest(
         "chunk_payload_bytes": LAYOUT.chunk_byte_capacity,
         "total_frames": total_frames,
     }
+    if version == LEGACY_FORMAT_VERSION:
+        manifest["key_mode"] = LEGACY_KEY_MODE
+    elif version == FORMAT_VERSION:
+        manifest["key_mode"] = STREAM_KEY_MODE
+        manifest["key_chunk_bytes"] = KEY_CHUNK_BYTES
+    else:
+        manifest["key_mode"] = STREAM_KEY_MODE
+    return manifest
+
+
+def build_manifest(
+    *,
+    original_filename: str,
+    media_type: str,
+    original_bytes: bytes,
+    stored_bytes: bytes,
+    total_frames: int,
+    version: int = FORMAT_VERSION,
+) -> dict[str, int | str | bool]:
+    return build_manifest_from_stats(
+        original_filename=original_filename,
+        media_type=media_type,
+        original_size=len(original_bytes),
+        stored_size=len(stored_bytes),
+        total_frames=total_frames,
+        sha256=hashlib.sha256(original_bytes).hexdigest(),
+        crc32=f"{zlib.crc32(original_bytes) & 0xFFFFFFFF:08x}",
+        version=version,
+    )
 
 
 def serialize_manifest(manifest: dict[str, object]) -> bytes:
     return json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
-def assemble_stream(manifest: dict[str, object], stored_bytes: bytes) -> bytes:
+def assemble_stream_prefix(manifest: dict[str, object]) -> bytes:
     manifest_bytes = serialize_manifest(manifest)
-    return STREAM_HEADER_STRUCT.pack(len(manifest_bytes)) + manifest_bytes + stored_bytes
+    return STREAM_HEADER_STRUCT.pack(len(manifest_bytes)) + manifest_bytes
+
+
+def assemble_stream(manifest: dict[str, object], stored_bytes: bytes) -> bytes:
+    return assemble_stream_prefix(manifest) + stored_bytes
 
 
 def parse_stream(stream_bytes: bytes) -> tuple[dict[str, object], bytes]:
@@ -198,6 +236,14 @@ def parse_stream(stream_bytes: bytes) -> tuple[dict[str, object], bytes]:
     return manifest, payload_bytes
 
 
+def stream_prefix_length(manifest: dict[str, object]) -> int:
+    return STREAM_HEADER_STRUCT.size + len(serialize_manifest(manifest))
+
+
+def total_stream_size(*, manifest: dict[str, object], stored_size: int) -> int:
+    return stream_prefix_length(manifest) + stored_size
+
+
 def chunk_stream(stream_bytes: bytes) -> list[bytes]:
     if not stream_bytes:
         return [b""]
@@ -208,37 +254,67 @@ def chunk_stream(stream_bytes: bytes) -> list[bytes]:
     ]
 
 
-def build_stream_with_manifest(
-    *, original_filename: str, media_type: str, original_bytes: bytes, stored_bytes: bytes
-) -> tuple[dict[str, object], bytes, list[bytes]]:
+def build_manifest_for_payload(
+    *,
+    original_filename: str,
+    media_type: str,
+    original_size: int,
+    stored_size: int,
+    sha256: str,
+    crc32: str,
+    version: int = FORMAT_VERSION,
+) -> dict[str, object]:
     total_frames = 0
 
     while True:
-        manifest = build_manifest(
+        manifest = build_manifest_from_stats(
             original_filename=original_filename,
             media_type=media_type,
-            original_bytes=original_bytes,
-            stored_bytes=stored_bytes,
+            original_size=original_size,
+            stored_size=stored_size,
             total_frames=total_frames,
+            sha256=sha256,
+            crc32=crc32,
+            version=version,
         )
-        stream_bytes = assemble_stream(manifest, stored_bytes)
-        chunks = chunk_stream(stream_bytes)
-        if len(chunks) == total_frames:
-            return manifest, stream_bytes, chunks
-        total_frames = len(chunks)
+        required_frames = max(1, math.ceil(total_stream_size(manifest=manifest, stored_size=stored_size) / LAYOUT.chunk_byte_capacity))
+        if required_frames == total_frames:
+            return manifest
+        total_frames = required_frames
+
+
+def build_stream_with_manifest(
+    *,
+    original_filename: str,
+    media_type: str,
+    original_bytes: bytes,
+    stored_bytes: bytes,
+    version: int = FORMAT_VERSION,
+) -> tuple[dict[str, object], bytes, list[bytes]]:
+    manifest = build_manifest_for_payload(
+        original_filename=original_filename,
+        media_type=media_type,
+        original_size=len(original_bytes),
+        stored_size=len(stored_bytes),
+        sha256=hashlib.sha256(original_bytes).hexdigest(),
+        crc32=f"{zlib.crc32(original_bytes) & 0xFFFFFFFF:08x}",
+        version=version,
+    )
+    stream_bytes = assemble_stream(manifest, stored_bytes)
+    return manifest, stream_bytes, chunk_stream(stream_bytes)
 
 
 def validate_manifest(manifest: dict[str, object]) -> None:
     if manifest.get("magic") != APP_MAGIC:
         raise ValueError("Video is not an app-generated bit video.")
-    if manifest.get("version") != FORMAT_VERSION:
+
+    version = manifest.get("version")
+    if version not in {LEGACY_FORMAT_VERSION, FORMAT_VERSION}:
         raise ValueError("Unsupported bit video version.")
     if manifest.get("keyed") is not True:
         raise ValueError("Video is not using the keyed format.")
     if manifest.get("key_length") != KEY_LENGTH:
         raise ValueError("Unexpected key length in manifest.")
-    if manifest.get("key_mode") != "custom24-scramble":
-        raise ValueError("Unexpected key mode in manifest.")
     if manifest.get("protected_scope") != "payload":
         raise ValueError("Unexpected protection scope in manifest.")
     if manifest.get("compressed") is not False:
@@ -255,3 +331,15 @@ def validate_manifest(manifest: dict[str, object]) -> None:
         raise ValueError("Unexpected payload chunk capacity in manifest.")
     if manifest.get("fps") != FPS:
         raise ValueError("Unexpected frame rate in manifest.")
+
+    if version == LEGACY_FORMAT_VERSION:
+        if manifest.get("key_mode") != LEGACY_KEY_MODE:
+            raise ValueError("Unexpected key mode in manifest.")
+        if "key_chunk_bytes" in manifest:
+            raise ValueError("Unexpected chunked key metadata in legacy manifest.")
+        return
+
+    if manifest.get("key_mode") != STREAM_KEY_MODE:
+        raise ValueError("Unexpected key mode in manifest.")
+    if manifest.get("key_chunk_bytes") != KEY_CHUNK_BYTES:
+        raise ValueError("Unexpected keyed chunk size in manifest.")

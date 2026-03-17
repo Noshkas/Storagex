@@ -77,15 +77,18 @@ StorageX expects you to bring your own client credentials. It does not ship with
 
 ## Supported files and limits
 
-- Upload inputs:
-  - `.txt`
-  - `.mp4`
+- Upload inputs: all file types are supported
+- Common examples:
+  - `.pptx`
+  - `.xlsx`
+  - `.docx`
   - `.pdf`
-  - `.jpeg`
-  - `.jpg`
-  - `.png`
-- Remote upload size limit: `10 MB`
-- Local decode upload size limit: `250 MB`
+  - images
+  - videos
+  - archives
+  - plain text
+- Upload size before encoding: no fixed hard cap; practical limits are local disk, encode time, and YouTube processing behavior
+- Local decode upload size limit: `1 GB`
 - Encryption key format: exactly `24` digits
 
 ## Organization model

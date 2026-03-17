@@ -26,3 +26,4 @@ cd /Users/noahjeske/Documents/storagex && uv run python scripts/benchmark_codec.
 - The `legacy` 100 MiB row is a linear estimate from the measured 10 MiB run. A direct full run was skipped because the old path is prohibitively slow at that size on this machine.
 - The new default local path uses dense raw-byte frames inside lossless `.mkv`, so frame count is dramatically lower than the bit-grid path. The bit-grid layout is still used for YouTube-safe archives and opt-in debug PNG artifacts.
 - The local `.mkv` archive is now close to payload size instead of expanding it heavily, while still decoding much faster than the old `.webm` path.
+- The YouTube-safe upload path now prefers `h264_videotoolbox` on macOS and falls back to `libx264 superfast` elsewhere. On this machine, a `10 MiB` upload-compatible encode dropped from about `15.17s` with `libx264 medium` to about `4.66s` with `h264_videotoolbox`, while keeping the output size close (`35.8 MiB` vs `39.4 MiB`).

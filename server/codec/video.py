@@ -4,7 +4,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -14,6 +16,7 @@ ProgressCallback = Callable[[int, str], None]
 FRAME_PROGRESS_PATTERN = re.compile(r"frame=\s*(\d+)")
 YOUTUBE_MIN_DURATION_SECONDS = 5
 RAW_FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT
+YOUTUBE_ENCODER_ENV = "STORAGEX_YOUTUBE_ENCODER"
 
 
 @dataclass(slots=True)
@@ -80,6 +83,7 @@ def encode_frames_to_youtube_mp4(
         filter_parts.append(f"tpad=stop_mode=clone:stop_duration={pad_duration:.3f}")
     filter_parts.append("format=yuv420p")
 
+    _, video_encoder_args = _resolve_youtube_video_encoder()
     command = [
         ffmpeg_executable(),
         "-y",
@@ -93,18 +97,7 @@ def encode_frames_to_youtube_mp4(
         "anullsrc=channel_layout=stereo:sample_rate=48000",
         "-vf",
         ",".join(filter_parts),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "18",
-        "-profile:v",
-        "high",
-        "-level",
-        "4.0",
-        "-pix_fmt",
-        "yuv420p",
+        *video_encoder_args,
         "-c:a",
         "aac",
         "-b:a",
@@ -164,6 +157,7 @@ def encode_raw_frames_to_youtube_mp4(
         filter_parts.append(f"tpad=stop_mode=clone:stop_duration={pad_duration:.3f}")
     filter_parts.append("format=yuv420p")
 
+    _, video_encoder_args = _resolve_youtube_video_encoder()
     command = [
         ffmpeg_executable(),
         "-y",
@@ -185,18 +179,7 @@ def encode_raw_frames_to_youtube_mp4(
         "anullsrc=channel_layout=stereo:sample_rate=48000",
         "-vf",
         ",".join(filter_parts),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "18",
-        "-profile:v",
-        "high",
-        "-level",
-        "4.0",
-        "-pix_fmt",
-        "yuv420p",
+        *video_encoder_args,
         "-c:a",
         "aac",
         "-b:a",
@@ -384,6 +367,75 @@ def _pad_duration(*, frame_count: int | None, fps: int, min_duration_seconds: in
     effective_frame_count = frame_count or 0
     current_duration = (effective_frame_count / fps) if effective_frame_count and fps > 0 else 0
     return max(0.0, float(min_duration_seconds) - current_duration)
+
+
+def _resolve_youtube_video_encoder() -> tuple[str, list[str]]:
+    override = os.environ.get(YOUTUBE_ENCODER_ENV, "").strip().lower()
+    if override in {"videotoolbox", "h264_videotoolbox"}:
+        return "h264_videotoolbox", _videotoolbox_encoder_args()
+    if override in {"libx264", "x264"}:
+        return "libx264", _libx264_encoder_args()
+
+    if sys.platform == "darwin" and "h264_videotoolbox" in _available_ffmpeg_encoders():
+        return "h264_videotoolbox", _videotoolbox_encoder_args()
+    return "libx264", _libx264_encoder_args()
+
+
+@lru_cache(maxsize=1)
+def _available_ffmpeg_encoders() -> frozenset[str]:
+    completed = subprocess.run(
+        [ffmpeg_executable(), "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return frozenset()
+
+    encoders: set[str] = set()
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].startswith("V"):
+            continue
+        encoders.add(parts[1])
+    return frozenset(encoders)
+
+
+def _libx264_encoder_args() -> list[str]:
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "superfast",
+        "-crf",
+        "18",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.0",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+
+def _videotoolbox_encoder_args() -> list[str]:
+    return [
+        "-c:v",
+        "h264_videotoolbox",
+        "-b:v",
+        "40M",
+        "-maxrate",
+        "80M",
+        "-bufsize",
+        "120M",
+        "-pix_fmt",
+        "yuv420p",
+        "-allow_sw",
+        "1",
+    ]
 
 
 def _run_ffmpeg(

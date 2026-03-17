@@ -482,6 +482,7 @@ def _encode_bitgrid_source(
 
     def frame_source():
         generated_frames = 0
+        progress_label = "Encoded upload frame" if target == "youtube" else "Encoded frame"
         for frame_index, chunk in enumerate(_iter_frame_chunks(source_path=source_path, key=normalized_key, manifest=manifest)):
             frame_pixels = _render_frame_pixels(frame_index=frame_index, chunk=chunk)
             if frames_dir is not None:
@@ -490,7 +491,7 @@ def _encode_bitgrid_source(
                 frame_paths.append(frame_path)
             generated_frames += 1
             frame_progress = 12 + math.floor((generated_frames / total_frames) * 80)
-            update(frame_progress, f"Encoded frame {generated_frames} of {total_frames}.")
+            update(frame_progress, f"{progress_label} {generated_frames} of {total_frames}.")
             yield frame_pixels.tobytes()
 
         if generated_frames != total_frames:

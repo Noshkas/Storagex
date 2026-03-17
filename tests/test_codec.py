@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from server.codec import video as codec_video
 from server.codec.constants import CELL_SIZE, FORMAT_VERSION, KEY_CHUNK_BYTES, LEGACY_FORMAT_VERSION, QUIET_MARGIN
 from server.codec.format import (
     DENSE_CHUNK_BYTE_CAPACITY,
@@ -314,6 +315,39 @@ def test_encode_frames_to_youtube_mp4_creates_h264_video_with_min_duration(tmp_p
     assert "h264" in codecs
     assert "aac" in codecs
     assert float(payload["format"]["duration"]) >= 5.0
+
+
+def test_resolve_youtube_video_encoder_prefers_videotoolbox_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(codec_video.YOUTUBE_ENCODER_ENV, raising=False)
+    monkeypatch.setattr(codec_video.sys, "platform", "darwin")
+    monkeypatch.setattr(codec_video, "_available_ffmpeg_encoders", lambda: frozenset({"h264_videotoolbox"}))
+
+    encoder_name, encoder_args = codec_video._resolve_youtube_video_encoder()
+
+    assert encoder_name == "h264_videotoolbox"
+    assert encoder_args == codec_video._videotoolbox_encoder_args()
+
+
+def test_resolve_youtube_video_encoder_falls_back_to_superfast_libx264(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(codec_video.YOUTUBE_ENCODER_ENV, raising=False)
+    monkeypatch.setattr(codec_video.sys, "platform", "linux")
+    monkeypatch.setattr(codec_video, "_available_ffmpeg_encoders", lambda: frozenset())
+
+    encoder_name, encoder_args = codec_video._resolve_youtube_video_encoder()
+
+    assert encoder_name == "libx264"
+    assert encoder_args == codec_video._libx264_encoder_args()
+
+
+def test_resolve_youtube_video_encoder_honors_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(codec_video.YOUTUBE_ENCODER_ENV, "libx264")
+    monkeypatch.setattr(codec_video.sys, "platform", "darwin")
+    monkeypatch.setattr(codec_video, "_available_ffmpeg_encoders", lambda: frozenset({"h264_videotoolbox"}))
+
+    encoder_name, encoder_args = codec_video._resolve_youtube_video_encoder()
+
+    assert encoder_name == "libx264"
+    assert encoder_args == codec_video._libx264_encoder_args()
 
 
 def test_decode_accepts_identical_duplicate_frames_for_youtube_recovery(tmp_path: Path) -> None:

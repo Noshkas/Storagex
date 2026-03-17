@@ -1,0 +1,213 @@
+{
+  "shares": {
+    "IEP3ebY5ftKmupt5aV0zGMrRWW6pLUHb": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:43:42.988920Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:43:42.988971Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T09:43:49.970830Z",
+      "revoked_at": "2026-03-17T09:47:26.447531Z",
+      "token": "IEP3ebY5ftKmupt5aV0zGMrRWW6pLUHb",
+      "used_at": null,
+      "video_id": "7Z4GnVKwirA"
+    },
+    "Ot4CUebFpEMhvHOs2ZVGsjqLaU4AXVc8": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:57:15.073492Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:57:15.073563Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T09:57:21.683708Z",
+      "revoked_at": "2026-03-17T10:20:20.367023Z",
+      "token": "Ot4CUebFpEMhvHOs2ZVGsjqLaU4AXVc8",
+      "used_at": null,
+      "video_id": "7Z4GnVKwirA"
+    },
+    "P5wWef0DeapkBg4WzK3meG-tfkbgc4zu": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T10:28:13.929082Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [
+        {
+          "downloaded_at": "2026-03-17T10:28:42.332945Z",
+          "ip_address": "176.7.199.198",
+          "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        }
+      ],
+      "expires_at": "2026-03-18T10:28:13.929136Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T10:28:20.412086Z",
+      "revoked_at": null,
+      "token": "P5wWef0DeapkBg4WzK3meG-tfkbgc4zu",
+      "used_at": "2026-03-17T10:28:42.332977Z",
+      "video_id": "7Z4GnVKwirA"
+    },
+    "PhIo86aV2PxdZ4PgzFTpG0mEoeScK5wT": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:25:04.394764Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:25:04.394804Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T09:25:11.349869Z",
+      "revoked_at": null,
+      "token": "PhIo86aV2PxdZ4PgzFTpG0mEoeScK5wT",
+      "used_at": "2026-03-17T09:25:27.138013Z",
+      "video_id": "7Z4GnVKwirA"
+    },
+    "Rr2spZxpzqKoy3aiDgQt8wFQplBJPLXg": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T10:20:27.926841Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [
+        {
+          "downloaded_at": "2026-03-17T10:20:58.730683Z",
+          "ip_address": "176.7.199.198",
+          "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        },
+        {
+          "downloaded_at": "2026-03-17T10:21:49.167407Z",
+          "ip_address": "176.7.199.198",
+          "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        },
+        {
+          "downloaded_at": "2026-03-17T10:22:01.732650Z",
+          "ip_address": "176.7.199.198",
+          "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        }
+      ],
+      "expires_at": "2026-03-18T10:20:27.926881Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T10:20:34.387916Z",
+      "revoked_at": "2026-03-17T10:26:34.240596Z",
+      "token": "Rr2spZxpzqKoy3aiDgQt8wFQplBJPLXg",
+      "used_at": null,
+      "video_id": "7Z4GnVKwirA"
+    },
+    "XaqQCQFt5tvYKMGpEYVl-pXI_UoyK3Vd": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:48:18.309679Z",
+      "display_name": "ATCR_10_-_Politics_Fake_News_and_Echo_Chambers_2.pdf",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:48:18.309725Z",
+      "media_type": "application/pdf",
+      "original_filename": "ATCR_10_-_Politics_Fake_News_and_Echo_Chambers_2.pdf",
+      "original_size": 6958685,
+      "prepared_at": "2026-03-17T09:48:34.447016Z",
+      "revoked_at": "2026-03-17T10:20:21.654814Z",
+      "token": "XaqQCQFt5tvYKMGpEYVl-pXI_UoyK3Vd",
+      "used_at": null,
+      "video_id": "l8Q4lWJ2eEg"
+    },
+    "ef6ks1S3IKZ07UHJkDg8WieYEpprpGRJ": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:47:26.447531Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:47:26.447558Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T09:47:32.909173Z",
+      "revoked_at": "2026-03-17T09:49:14.798690Z",
+      "token": "ef6ks1S3IKZ07UHJkDg8WieYEpprpGRJ",
+      "used_at": null,
+      "video_id": "7Z4GnVKwirA"
+    },
+    "h6Bog-002U64kc-tHWpt8gXcnSxMcLl8": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:55:49.320692Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:55:49.320729Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T09:55:56.129468Z",
+      "revoked_at": "2026-03-17T09:57:11.391553Z",
+      "token": "h6Bog-002U64kc-tHWpt8gXcnSxMcLl8",
+      "used_at": null,
+      "video_id": "7Z4GnVKwirA"
+    },
+    "hYjMmuwQibdgySPrDazsSNyS4yTZRmVo": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:49:14.798690Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:49:14.798716Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T09:49:21.230414Z",
+      "revoked_at": "2026-03-17T09:55:13.122013Z",
+      "token": "hYjMmuwQibdgySPrDazsSNyS4yTZRmVo",
+      "used_at": null,
+      "video_id": "7Z4GnVKwirA"
+    },
+    "rbiKtoWwvT252lTsdRw55GcyTB7Zuus_": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:57:11.391553Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:57:11.391612Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": null,
+      "revoked_at": "2026-03-17T09:57:15.073492Z",
+      "token": "rbiKtoWwvT252lTsdRw55GcyTB7Zuus_",
+      "used_at": null,
+      "video_id": "7Z4GnVKwirA"
+    },
+    "vND9zOsM7kXMiBYMWSQ8ELboMei9ZPj8": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T09:55:13.122013Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [],
+      "expires_at": "2026-03-18T09:55:13.122083Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T09:55:20.312821Z",
+      "revoked_at": "2026-03-17T09:55:49.320692Z",
+      "token": "vND9zOsM7kXMiBYMWSQ8ELboMei9ZPj8",
+      "used_at": null,
+      "video_id": "7Z4GnVKwirA"
+    },
+    "xnoQTGtKE1Jlm89fRgZk9jJHsAvY7SR7": {
+      "artifact_relpath": null,
+      "created_at": "2026-03-17T10:33:27.680277Z",
+      "display_name": "clean_long_run_profitability_chart.png",
+      "downloads": [
+        {
+          "downloaded_at": "2026-03-17T10:33:44.163812Z",
+          "ip_address": "176.7.199.198",
+          "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        }
+      ],
+      "expires_at": "2026-03-18T10:33:27.680311Z",
+      "media_type": "image/png",
+      "original_filename": "clean_long_run_profitability_chart.png",
+      "original_size": 108336,
+      "prepared_at": "2026-03-17T10:33:34.228125Z",
+      "revoked_at": null,
+      "token": "xnoQTGtKE1Jlm89fRgZk9jJHsAvY7SR7",
+      "used_at": "2026-03-17T10:33:44.163836Z",
+      "video_id": "7Z4GnVKwirA"
+    }
+  },
+  "version": 3
+}

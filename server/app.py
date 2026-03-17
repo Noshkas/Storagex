@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 import shutil
@@ -10,17 +11,19 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
+from .app_settings import AppSettingsError, AppSettingsStore
 from .codec.constants import (
     ALLOWED_DECODE_EXTENSIONS,
+    DATA_DIR,
     JOBS_DIR,
-    JOB_TTL_SECONDS,
     MAX_DECODE_UPLOAD_SIZE,
     YOUTUBE_VIDEO_NAME,
 )
@@ -35,6 +38,8 @@ from .library_index import (
     LibraryIndexError,
     LibraryIndexStore,
 )
+from .quick_tunnel import QuickTunnelError, QuickTunnelManager
+from .share_store import SHARE_ARTIFACTS_DIR, ShareAccessError, ShareRecord, ShareReuseRestorePoint, ShareStore
 from .youtube import YouTubeAuthError, YouTubeConfigurationError, YouTubeError, YouTubeService, YouTubeSessionExpiredError
 
 logger = logging.getLogger(__name__)
@@ -100,11 +105,22 @@ class JobStore:
 jobs = JobStore()
 youtube_service = YouTubeService()
 library_index = LibraryIndexStore()
+app_settings = AppSettingsStore()
+share_store = ShareStore()
+quick_tunnel_manager = QuickTunnelManager()
 
 
 class YouTubeSettingsPayload(BaseModel):
     client_id: str
     client_secret: str
+
+
+class AppSettingsPayload(BaseModel):
+    public_app_url: str | None = ""
+
+
+class ShareCreatePayload(BaseModel):
+    key: str
 
 
 class FolderCreatePayload(BaseModel):
@@ -125,26 +141,64 @@ class FileUpdatePayload(BaseModel):
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    SHARE_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_expired_jobs()
-    yield
+    _cleanup_stale_share_artifacts()
+    try:
+        yield
+    finally:
+        quick_tunnel_manager.stop()
 
 
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
+@app.middleware("http")
+async def restrict_public_host_to_share_routes(request: Request, call_next):
+    if _request_uses_public_host(request) and not _is_public_share_path(request.url.path):
+        return PlainTextResponse("Not Found", status_code=404)
+    return await call_next(request)
+
+
 @app.get("/")
 async def index() -> HTMLResponse:
-    index_path = Path("static/index.html")
-    asset_paths = [
-        index_path,
-        Path("static/app.js"),
-        Path("static/styles.css"),
-        Path("static/favicon.svg"),
-    ]
-    asset_version = max(int(path.stat().st_mtime) for path in asset_paths if path.exists())
-    html = index_path.read_text(encoding="utf-8").replace("__ASSET_VERSION__", str(asset_version))
-    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(
+        _render_html_file(
+            Path("static/index.html"),
+            asset_paths=[
+                Path("static/index.html"),
+                Path("static/app.js"),
+                Path("static/styles.css"),
+                Path("static/favicon.svg"),
+            ],
+        ),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/s/{token}")
+async def share_page(token: str) -> HTMLResponse:
+    _cleanup_share_artifact_if_unavailable(token)
+    share_payload = _public_share_payload(token)
+    html = _render_html_file(
+        Path("static/share.html"),
+        asset_paths=[
+            Path("static/share.html"),
+            Path("static/share.js"),
+            Path("static/share.css"),
+            Path("static/favicon.svg"),
+        ],
+        replacements={
+            "__SHARE_PAGE_DATA__": _json_for_html(share_payload),
+        },
+    )
+    status_code = 200
+    if share_payload["status"] == "invalid":
+        status_code = 404
+    elif share_payload["status"] not in {"active", "pending"}:
+        status_code = 410
+    return HTMLResponse(html, status_code=status_code, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/favicon.ico")
@@ -225,6 +279,29 @@ async def save_youtube_settings(payload: YouTubeSettingsPayload) -> dict[str, An
             client_secret=payload.client_secret,
         )
     except YouTubeConfigurationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/settings/app")
+async def get_app_settings() -> dict[str, Any]:
+    return app_settings.snapshot()
+
+
+@app.post("/api/settings/app")
+async def save_app_settings(payload: AppSettingsPayload) -> dict[str, Any]:
+    try:
+        return app_settings.update(public_app_url=payload.public_app_url)
+    except AppSettingsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/settings/app/public-url/quick-tunnel")
+async def create_quick_tunnel_public_url(request: Request) -> dict[str, Any]:
+    local_origin = _local_origin_for_tunnel(request)
+    try:
+        public_app_url = quick_tunnel_manager.ensure_started(local_url=local_origin)
+        return app_settings.update(public_app_url=public_app_url)
+    except (QuickTunnelError, AppSettingsError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -375,6 +452,58 @@ async def delete_library_file(video_id: str) -> dict[str, Any]:
     }
 
 
+@app.post("/api/library/files/{video_id}/share")
+async def create_library_file_share(video_id: str, payload: ShareCreatePayload, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    settings_snapshot = app_settings.snapshot()
+    public_app_url = str(settings_snapshot.get("public_app_url") or "")
+    if not public_app_url:
+        raise HTTPException(status_code=400, detail="Create or save a Public App URL in Settings before sharing files.")
+
+    try:
+        normalized_key = validate_numeric_key(payload.key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    youtube_status = youtube_service.session_status()
+    if not youtube_status.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Save a YouTube client ID and client secret first.",
+        )
+    if not youtube_status.connected:
+        raise HTTPException(status_code=409, detail="Connect YouTube before sharing files.")
+
+    try:
+        _ensure_local_file_entry(video_id)
+        remote_file = youtube_service.get_file(video_id)
+    except YouTubeSessionExpiredError as exc:
+        youtube_service.disconnect()
+        raise HTTPException(status_code=409, detail="Your YouTube session expired. Connect YouTube again.") from exc
+    except (YouTubeError, FileEntryNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail="File not found.") from exc
+
+    display_name = library_index.resolve_download_name(video_id, remote_file.original_filename)
+    share = share_store.create_or_replace(
+        video_id=video_id,
+        display_name=display_name,
+        original_filename=remote_file.original_filename,
+        original_size=remote_file.original_size,
+        media_type=remote_file.media_type,
+    )
+    _cleanup_stale_share_artifacts()
+    job = jobs.create("share_prepare")
+    jobs.update(
+        job.job_id,
+        metadata={
+            "share_token": share.token,
+            "share_url": _build_share_url(public_app_url, share.token),
+            "display_filename": share.display_name,
+        },
+    )
+    background_tasks.add_task(_run_share_prepare_job, job.job_id, share, normalized_key, public_app_url)
+    return {"job_id": job.job_id, "status": job.status}
+
+
 @app.post("/api/files")
 async def start_remote_upload(
     background_tasks: BackgroundTasks,
@@ -500,23 +629,114 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
     return _serialize_job(request, job)
 
 
+@app.get("/api/library/shares")
+async def list_library_shares() -> dict[str, Any]:
+    public_app_url = str(app_settings.snapshot().get("public_app_url") or "")
+    return {
+        "shares": [_serialize_owner_share(share, public_app_url=public_app_url) for share in share_store.list_records()],
+    }
+
+
+@app.post("/api/library/shares/{token}/revoke")
+async def revoke_library_share(token: str) -> dict[str, Any]:
+    try:
+        share = share_store.revoke(token)
+    except ShareAccessError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    _cleanup_share_artifact(share)
+    public_app_url = str(app_settings.snapshot().get("public_app_url") or "")
+    refreshed_share = share_store.get(token) or share
+    return {
+        "status": "revoked",
+        "share": _serialize_owner_share(refreshed_share, public_app_url=public_app_url),
+    }
+
+
+@app.post("/api/library/shares/{token}/extend")
+async def extend_library_share(token: str, payload: ShareCreatePayload, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    try:
+        normalized_key = validate_numeric_key(payload.key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    youtube_status = youtube_service.session_status()
+    if not youtube_status.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Save a YouTube client ID and client secret first.",
+        )
+    if not youtube_status.connected:
+        raise HTTPException(status_code=409, detail="Connect YouTube before extending links.")
+
+    try:
+        share, restore_point = share_store.reopen_used(token)
+    except ShareAccessError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    _cleanup_stale_share_artifacts()
+    public_app_url = str(app_settings.snapshot().get("public_app_url") or "")
+    job = jobs.create("share_extend")
+    jobs.update(
+        job.job_id,
+        metadata={
+            "share_token": share.token,
+            "share_url": _build_share_url(public_app_url, share.token),
+            "display_filename": share.display_name,
+        },
+    )
+    background_tasks.add_task(_run_share_prepare_job, job.job_id, share, normalized_key, public_app_url, restore_point=restore_point)
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "share": _serialize_owner_share(share, public_app_url=public_app_url),
+    }
+
+
+@app.get("/api/shares/{token}/download", name="share_download")
+async def download_shared_file(request: Request, token: str) -> FileResponse:
+    try:
+        share = share_store.require_ready(token)
+    except ShareAccessError as exc:
+        _cleanup_share_artifact_if_unavailable(token)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    candidate = _share_artifact_path(share)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="File not ready.")
+
+    media_type = str(share.media_type or mimetypes.guess_type(candidate.name)[0] or "application/octet-stream")
+    download_name = str(share.display_name or share.original_filename or candidate.name)
+    try:
+        claimed_share = share_store.claim_download(
+            token,
+            ip_address=_resolve_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+    except ShareAccessError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return FileResponse(
+        candidate,
+        media_type=media_type,
+        filename=download_name,
+        headers={"Cache-Control": "no-store"},
+        background=BackgroundTask(_cleanup_share_artifact, claimed_share),
+    )
+
+
 @app.get("/api/artifacts/{job_id}/{artifact_path:path}", name="artifact_file")
 async def get_artifact(job_id: str, artifact_path: str) -> FileResponse:
-    job_dir = (JOBS_DIR / job_id).resolve()
-    if not job_dir.exists():
-        raise HTTPException(status_code=404, detail="Job not found.")
-
-    candidate = (job_dir / artifact_path).resolve()
-    try:
-        candidate.relative_to(job_dir)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid artifact path.") from exc
-
-    if not candidate.exists() or not candidate.is_file():
+    candidate = _job_artifact_path(job_id, artifact_path)
+    if candidate is None:
         raise HTTPException(status_code=404, detail="Artifact not found.")
 
     media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
-    return FileResponse(candidate, media_type=media_type)
+    return FileResponse(
+        candidate,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+        background=BackgroundTask(_cleanup_job_artifact_after_download, job_id, artifact_path),
+    )
 
 
 def _run_remote_upload_job(
@@ -567,7 +787,7 @@ def _run_remote_upload_job(
         jobs.update(job_id, status="failed", error=f"Unexpected error: {exc}", message="Upload failed.")
         return
     finally:
-        shutil.rmtree(job_dir, ignore_errors=True)
+        _cleanup_job_dir(job_id)
 
     manifest = result.manifest
     remote_payload = _serialize_library_file(remote_file, local_entry)
@@ -621,16 +841,21 @@ def _run_remote_download_job(job_id: str, video_id: str, key: str) -> None:
         )
     except CodecError as exc:
         jobs.update(job_id, status="failed", error=str(exc), message="Download failed.")
+        _cleanup_job_dir(job_id)
         return
     except YouTubeError as exc:
         jobs.update(job_id, status="failed", error=str(exc), message="Download failed.")
+        _cleanup_job_dir(job_id)
         return
     except Exception as exc:  # pragma: no cover - defensive fallback
         jobs.update(job_id, status="failed", error=f"Unexpected error: {exc}", message="Download failed.")
+        _cleanup_job_dir(job_id)
         return
 
     manifest = result.manifest
     display_filename = library_index.resolve_download_name(video_id, str(manifest["original_filename"]))
+    recovered_relpath = str(result.restored_path.relative_to(job_dir))
+    _prune_job_dir(job_id, keep_relpaths=[recovered_relpath])
     jobs.update(
         job_id,
         status="completed",
@@ -652,8 +877,110 @@ def _run_remote_download_job(job_id: str, video_id: str, key: str) -> None:
             "remote_file": remote_file.to_dict(),
         },
         artifacts={
-            "recovered_file": str(result.restored_path.relative_to(job_dir)),
-            "manifest": str(result.manifest_path.relative_to(job_dir)),
+            "recovered_file": recovered_relpath,
+        },
+    )
+
+
+def _run_share_prepare_job(
+    job_id: str,
+    share: ShareRecord,
+    key: str,
+    public_app_url: str,
+    *,
+    restore_point: ShareReuseRestorePoint | None = None,
+) -> None:
+    from .codec.service import CodecError, decode_video
+
+    job_dir = JOBS_DIR / job_id
+
+    def fail_share_prepare(error: str) -> None:
+        if restore_point is None:
+            _revoke_share_safely(share.token)
+        else:
+            share_store.restore_reopened(share.token, restore_point)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        jobs.update(job_id, status="failed", error=error, message="Share failed.")
+
+    jobs.update(
+        job_id,
+        status="running",
+        progress=2,
+        message="Preparing shared file.",
+        metadata={
+            "share_token": share.token,
+            "display_filename": share.display_name,
+            "media_type": share.media_type,
+            "share_url": _build_share_url(public_app_url, share.token),
+        },
+    )
+
+    try:
+        source_dir = job_dir / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        jobs.update(job_id, status="running", progress=15, message="Downloading file.")
+        downloaded_video_path = youtube_service.download_video(video_id=share.video_id, output_dir=source_dir)
+        result = decode_video(
+            video_path=downloaded_video_path,
+            job_dir=job_dir,
+            key=key,
+            allow_duplicate_frame_chunks=True,
+            progress=lambda progress, message: jobs.update(
+                job_id,
+                status="running",
+                progress=_scaled_progress(progress, start=35, end=99),
+                message=message,
+            ),
+        )
+    except CodecError:
+        logger.warning("Share preparation decode failed for token %s.", share.token, exc_info=True)
+        fail_share_prepare("Could not prepare this share.")
+        return
+    except YouTubeError:
+        logger.warning("Share preparation YouTube download failed for token %s.", share.token, exc_info=True)
+        fail_share_prepare("Could not prepare this share.")
+        return
+    except Exception:
+        logger.warning("Unexpected share preparation failure for token %s.", share.token, exc_info=True)
+        fail_share_prepare("Could not prepare this share.")
+        return
+
+    if not result.integrity_ok:
+        fail_share_prepare("That key does not unlock this file.")
+        return
+
+    manifest = result.manifest
+    display_filename = share.display_name or str(manifest["original_filename"])
+    artifact_path = _prepare_share_artifact(share.token, result.restored_path, display_filename)
+    try:
+        prepared_share = share_store.mark_prepared(
+            share.token,
+            artifact_relpath=str(artifact_path.relative_to(DATA_DIR)),
+        )
+    except ShareAccessError:
+        logger.info("Discarding prepared artifact for unavailable share token %s.", share.token)
+        shutil.rmtree(artifact_path.parent, ignore_errors=True)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        jobs.update(job_id, status="failed", error="This share link is no longer available.", message="Share failed.")
+        return
+    shutil.rmtree(job_dir, ignore_errors=True)
+    jobs.update(
+        job_id,
+        status="completed",
+        progress=100,
+        message="Share is ready.",
+        metadata={
+            "share_token": prepared_share.token,
+            "display_filename": prepared_share.display_name,
+            "original_filename": manifest["original_filename"],
+            "media_type": manifest["media_type"],
+            "original_size": manifest["original_size"],
+            "compressed": manifest["compressed"],
+            "sha256": manifest["sha256"],
+            "crc32": manifest["crc32"],
+            "frame_count": manifest["total_frames"],
+            "fps": manifest["fps"],
+            "share_url": _build_share_url(public_app_url, prepared_share.token),
         },
     )
 
@@ -688,9 +1015,11 @@ def _run_encode_job(
         )
     except CodecError as exc:
         jobs.update(job_id, status="failed", error=str(exc), message="Encode failed.")
+        _cleanup_job_dir(job_id)
         return
     except Exception as exc:  # pragma: no cover - defensive fallback
         jobs.update(job_id, status="failed", error=f"Unexpected error: {exc}", message="Encode failed.")
+        _cleanup_job_dir(job_id)
         return
 
     manifest = result.manifest
@@ -707,14 +1036,20 @@ def _run_encode_job(
         "duration_seconds": round(int(manifest["total_frames"]) / int(manifest["fps"]), 2),
     }
     if result.frame_paths:
-        metadata["frame_files"] = [str(path.relative_to(job_dir)) for path in result.frame_paths]
+        metadata["frame_files"] = [
+            {
+                "index": index + 1,
+                "name": path.name,
+            }
+            for index, path in enumerate(result.frame_paths)
+        ]
 
     artifacts: dict[str, Any] = {
         "video": str(result.video_path.relative_to(job_dir)),
-        "manifest": str(result.manifest_path.relative_to(job_dir)),
     }
     if result.frames_zip_path is not None:
         artifacts["frames_zip"] = str(result.frames_zip_path.relative_to(job_dir))
+    _prune_job_dir(job_id, keep_relpaths=list(artifacts.values()))
 
     jobs.update(
         job_id,
@@ -746,12 +1081,16 @@ def _run_decode_job(job_id: str, source_path: Path, key: str) -> None:
         )
     except CodecError as exc:
         jobs.update(job_id, status="failed", error=str(exc), message="Decode failed.")
+        _cleanup_job_dir(job_id)
         return
     except Exception as exc:  # pragma: no cover - defensive fallback
         jobs.update(job_id, status="failed", error=f"Unexpected error: {exc}", message="Decode failed.")
+        _cleanup_job_dir(job_id)
         return
 
     manifest = result.manifest
+    recovered_relpath = str(result.restored_path.relative_to(job_dir))
+    _prune_job_dir(job_id, keep_relpaths=[recovered_relpath])
     jobs.update(
         job_id,
         status="completed",
@@ -769,8 +1108,7 @@ def _run_decode_job(job_id: str, source_path: Path, key: str) -> None:
             "integrity_ok": result.integrity_ok,
         },
         artifacts={
-            "recovered_file": str(result.restored_path.relative_to(job_dir)),
-            "manifest": str(result.manifest_path.relative_to(job_dir)),
+            "recovered_file": recovered_relpath,
         },
     )
 
@@ -844,7 +1182,7 @@ def _serialize_job(request: Request, job: JobRecord) -> dict[str, Any]:
     }
 
     frame_files = job.metadata.get("frame_files")
-    if isinstance(frame_files, list):
+    if isinstance(frame_files, list) and frame_files and all(isinstance(item, str) for item in frame_files):
         payload["metadata"]["frame_files"] = [
             {
                 "index": index + 1,
@@ -865,16 +1203,349 @@ def _artifact_url(request: Request, job_id: str, artifact_path: Any) -> Any:
     return str(request.url_for("artifact_file", job_id=job_id, artifact_path=artifact_path))
 
 
+def _job_artifact_path(job_id: str, artifact_path: str) -> Path | None:
+    if not artifact_path:
+        return None
+
+    job_dir = (JOBS_DIR / job_id).resolve()
+    if not job_dir.exists():
+        return None
+
+    candidate = (job_dir / artifact_path).resolve()
+    try:
+        candidate.relative_to(job_dir)
+    except ValueError:
+        return None
+
+    if not candidate.exists() or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _cleanup_job_dir(job_id: str) -> None:
+    shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
+
+
+def _prune_job_dir(job_id: str, *, keep_relpaths: list[str]) -> None:
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.exists():
+        return
+
+    job_root = job_dir.resolve()
+    keep_paths: set[Path] = set()
+    keep_dirs: set[Path] = {job_root}
+
+    for relpath in keep_relpaths:
+        if not relpath:
+            continue
+        candidate = (job_dir / relpath).resolve()
+        try:
+            candidate.relative_to(job_root)
+        except ValueError:
+            continue
+        if not candidate.exists():
+            continue
+        keep_paths.add(candidate)
+        for parent in candidate.parents:
+            keep_dirs.add(parent.resolve())
+            if parent.resolve() == job_root:
+                break
+
+    if not keep_paths:
+        _cleanup_job_dir(job_id)
+        return
+
+    for candidate in sorted(job_dir.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+        resolved = candidate.resolve()
+        if resolved in keep_paths or resolved in keep_dirs:
+            continue
+        if candidate.is_dir():
+            shutil.rmtree(candidate, ignore_errors=True)
+            continue
+        candidate.unlink(missing_ok=True)
+
+
+def _cleanup_job_artifact_after_download(job_id: str, artifact_path: str) -> None:
+    candidate = _job_artifact_path(job_id, artifact_path)
+    if candidate is not None:
+        candidate.unlink(missing_ok=True)
+    _cleanup_empty_job_dirs(job_id)
+
+
+def _cleanup_empty_job_dirs(job_id: str) -> None:
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.exists():
+        return
+
+    for directory in sorted((path for path in job_dir.rglob("*") if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            continue
+
+    try:
+        job_dir.rmdir()
+    except OSError:
+        return
+
+
+def _build_share_url(public_app_url: str, token: str) -> str:
+    return f"{public_app_url.rstrip('/')}/s/{token}"
+
+
+def _public_share_payload(token: str) -> dict[str, Any]:
+    share = share_store.get(token)
+    if share is None:
+        return {
+            "token": token,
+            "status": "invalid",
+            "message": "This share link is invalid.",
+            "share": None,
+        }
+
+    status = share_store.get_status(token)
+    return {
+        "token": token,
+        "status": status,
+        "message": _share_status_message(status),
+        "share": _serialize_public_share(share),
+    }
+
+
+def _serialize_owner_share(share: ShareRecord, *, public_app_url: str) -> dict[str, Any]:
+    status = share_store.get_status(share.token)
+    return {
+        "token": share.token,
+        "video_id": share.video_id,
+        "display_name": share.display_name,
+        "original_filename": share.original_filename,
+        "original_size": share.original_size,
+        "media_type": share.media_type,
+        "created_at": share.created_at,
+        "expires_at": share.expires_at,
+        "prepared_at": share.prepared_at,
+        "revoked_at": share.revoked_at,
+        "status": status,
+        "share_url": _build_share_url(public_app_url, share.token) if public_app_url else None,
+        "download_count": len(share.downloads),
+        "downloads": [_serialize_owner_download(download) for download in reversed(share.downloads)],
+    }
+
+
+def _serialize_owner_download(download: Any) -> dict[str, Any]:
+    return {
+        "downloaded_at": download.downloaded_at,
+        "ip_address": download.ip_address,
+        "user_agent": download.user_agent,
+    }
+
+
+def _serialize_public_share(share: ShareRecord) -> dict[str, Any]:
+    return {
+        "display_name": share.display_name,
+        "original_filename": share.original_filename,
+        "original_size": share.original_size,
+        "media_type": share.media_type,
+        "expires_at": share.expires_at,
+        "download_url": f"/api/shares/{share.token}/download" if share.artifact_relpath else None,
+        "download_count": len(share.downloads),
+    }
+
+
+def _share_status_message(status: str) -> str:
+    if status == "pending":
+        return "This file is preparing."
+    if status == "used":
+        return "This share link has already been used."
+    if status == "expired":
+        return "This share link has expired."
+    if status == "revoked":
+        return "This share link is no longer available."
+    if status == "invalid":
+        return "This share link is invalid."
+    return ""
+
+
+def _json_for_html(payload: dict[str, Any]) -> str:
+    return (
+        json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+
+
+def _render_html_file(path: Path, *, asset_paths: list[Path], replacements: dict[str, str] | None = None) -> str:
+    html = path.read_text(encoding="utf-8")
+    html = html.replace("__ASSET_VERSION__", str(_asset_version(asset_paths)))
+    for placeholder, value in (replacements or {}).items():
+        html = html.replace(placeholder, value)
+    return html
+
+
+def _asset_version(paths: list[Path]) -> int:
+    return max(int(path.stat().st_mtime) for path in paths if path.exists())
+
+
+def _local_origin_for_tunnel(request: Request) -> str:
+    current_base = str(request.base_url).rstrip("/")
+    parsed = urlsplit(current_base)
+    if parsed.hostname in {"127.0.0.1", "localhost"} and parsed.scheme in {"http", "https"}:
+        return current_base
+    port = parsed.port or 8000
+    scheme = parsed.scheme if parsed.scheme in {"http", "https"} else "http"
+    return f"{scheme}://127.0.0.1:{port}"
+
+
+def _resolve_client_ip(request: Request) -> str:
+    for header_name in ("cf-connecting-ip", "true-client-ip", "x-real-ip", "x-forwarded-for", "forwarded"):
+        raw_value = str(request.headers.get(header_name) or "").strip()
+        if not raw_value:
+            continue
+        if header_name == "forwarded":
+            candidate = _forwarded_for_ip(raw_value)
+            if candidate:
+                return candidate
+            continue
+        if header_name == "x-forwarded-for":
+            return _normalize_ip_candidate(_first_forwarded_value(raw_value))
+        return _normalize_ip_candidate(raw_value)
+    if request.client and request.client.host:
+        return _normalize_ip_candidate(request.client.host)
+    return "unknown"
+
+
+def _first_forwarded_value(value: str) -> str:
+    first = value.split(",", 1)[0].strip()
+    return first or "unknown"
+
+
+def _forwarded_for_ip(value: str) -> str | None:
+    for part in value.split(";"):
+        key, _, raw = part.strip().partition("=")
+        if key.lower() != "for" or not raw:
+            continue
+        return _normalize_ip_candidate(raw.strip().strip('"'))
+    return None
+
+
+def _normalize_ip_candidate(value: str) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return "unknown"
+    if candidate.startswith("[") and "]" in candidate:
+        return candidate[1:candidate.index("]")]
+    if candidate.count(":") == 1 and "." in candidate:
+        host, _, port = candidate.partition(":")
+        if port.isdigit():
+            return host
+    return candidate
+
+
+def _request_uses_public_host(request: Request) -> bool:
+    public_app_url = str(app_settings.snapshot().get("public_app_url") or "")
+    if not public_app_url:
+        return False
+    current_host = (request.headers.get("host") or "").strip().lower()
+    public_host = (urlsplit(public_app_url).netloc or "").strip().lower()
+    return bool(current_host and public_host and current_host == public_host)
+
+
+def _is_public_share_path(path: str) -> bool:
+    return path.startswith("/s/") or path.startswith("/api/shares/") or path in {
+        "/static/share.css",
+        "/static/share.js",
+        "/static/favicon.svg",
+        "/favicon.ico",
+    }
+
+
+def _prepare_share_artifact(token: str, restored_path: Path, display_name: str) -> Path:
+    artifact_dir = SHARE_ARTIFACTS_DIR / token / uuid.uuid4().hex
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_name = sanitize_filename(display_name, fallback=restored_path.name)
+    artifact_path = artifact_dir / artifact_name
+    shutil.move(str(restored_path), artifact_path)
+    return artifact_path
+
+
+def _share_artifact_path(share: ShareRecord) -> Path | None:
+    artifact_relpath = str(share.artifact_relpath or "")
+    if not artifact_relpath:
+        return None
+    candidate = (DATA_DIR / artifact_relpath).resolve()
+    try:
+        candidate.relative_to(DATA_DIR.resolve())
+    except ValueError:
+        return None
+    if not candidate.exists() or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _revoke_share_safely(token: str) -> None:
+    share = share_store.get(token)
+    if share is None:
+        return
+    try:
+        share_store.revoke(token)
+    except ShareAccessError:
+        return
+    _cleanup_share_artifact(share)
+
+
+def _cleanup_share_artifact(share: ShareRecord) -> None:
+    artifact_path = _share_artifact_path(share)
+    if artifact_path is None:
+        return
+    artifact_dir = artifact_path.parent
+    shutil.rmtree(artifact_dir, ignore_errors=True)
+    _cleanup_empty_share_artifact_dirs(artifact_dir.parent)
+    try:
+        share_store.clear_artifact(share.token)
+    except ShareAccessError:
+        return
+
+
+def _cleanup_share_artifact_if_unavailable(token: str) -> None:
+    share = share_store.get(token)
+    if share is None:
+        return
+    if share_store.get_status(token) not in {"used", "expired", "revoked"}:
+        return
+    _cleanup_share_artifact(share)
+
+
+def _cleanup_stale_share_artifacts() -> None:
+    for share in share_store.artifact_cleanup_candidates():
+        _cleanup_share_artifact(share)
+
+
+def _cleanup_empty_share_artifact_dirs(start_dir: Path) -> None:
+    root = SHARE_ARTIFACTS_DIR.resolve()
+    current = start_dir.resolve()
+    try:
+        current.relative_to(root)
+    except ValueError:
+        return
+
+    while current != root:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
 def _scaled_progress(progress: int, *, start: int, end: int) -> int:
     clamped = max(0, min(100, progress))
     return start + round(((end - start) * clamped) / 100)
 
 
 def _cleanup_expired_jobs() -> None:
-    now = time.time()
+    if not JOBS_DIR.exists():
+        return
     for job_dir in JOBS_DIR.iterdir():
         if not job_dir.is_dir():
             continue
-        age = now - job_dir.stat().st_mtime
-        if age > JOB_TTL_SECONDS:
-            shutil.rmtree(job_dir, ignore_errors=True)
+        shutil.rmtree(job_dir, ignore_errors=True)

@@ -35,6 +35,7 @@ const state = {
     client_id: "",
     has_client_secret: false,
     source: "none",
+    public_app_url: "",
   },
   currentFolderId: ROOT_FOLDER_ID,
   selectedVideoId: "",
@@ -51,9 +52,25 @@ const state = {
   renamePending: false,
   folderDropdownOpen: false,
   newFolderColorId: FOLDER_COLORS[0].id,
+  searchQuery: "",
+  sortKey: "uploaded_at",
+  sortDir: "desc",
+  pendingUpload: null,
+  links: [],
+  linksLoading: false,
+  linksOpen: false,
+  linksPollTimer: null,
+  extendingShareToken: "",
+  shareLinkOpen: false,
+  sharingVideoId: "",
+  sharingStartTime: 0,
+  downloadingVideoId: "",
+  downloadStartTime: 0,
+  timerInterval: null,
 };
 
 const dataTable = document.querySelector("#data-table");
+const dataTableHead = document.querySelector(".data-table__head");
 const filesList = document.querySelector("#files-list");
 const emptyState = document.querySelector("#empty-state");
 const emptyTitle = document.querySelector("#empty-title");
@@ -61,17 +78,23 @@ const uploadButton = document.querySelector("#upload-button");
 const uploadIcon = document.querySelector("#upload-icon");
 const uploadInput = document.querySelector("#upload-input");
 const settingsButton = document.querySelector("#settings-button");
+const sharesButton = document.querySelector("#shares-button");
 const settingsModal = document.querySelector("#settings-modal");
 const settingsBackdrop = settingsModal.querySelector(".modal__backdrop");
 const settingsForm = document.querySelector("#settings-form");
 const settingsKey = document.querySelector("#settings-key");
 const settingsClientId = document.querySelector("#settings-client-id");
 const settingsClientSecret = document.querySelector("#settings-client-secret");
+const settingsPublicAppUrl = document.querySelector("#settings-public-app-url");
+const settingsCreatePublicUrl = document.querySelector("#settings-create-public-url");
 const settingsError = document.querySelector("#settings-error");
 const settingsClose = document.querySelector("#settings-close");
 const settingsCancel = document.querySelector("#settings-cancel");
 const disconnectButton = document.querySelector("#disconnect-button");
 const resetButton = document.querySelector("#reset-button");
+const appbarSearch = document.querySelector("#appbar-search");
+const searchToggle = document.querySelector("#search-toggle");
+const searchInput = document.querySelector("#search-input");
 const folderDropdown = document.querySelector("#folder-dropdown");
 const folderDropdownBtn = document.querySelector("#folder-dropdown-btn");
 const folderDropdownLabel = document.querySelector("#folder-dropdown-label");
@@ -109,12 +132,25 @@ const confirmMessage = document.querySelector("#confirm-message");
 const confirmClose = document.querySelector("#confirm-close");
 const confirmCancel = document.querySelector("#confirm-cancel");
 const confirmSubmit = document.querySelector("#confirm-submit");
+const shareLinkModal = document.querySelector("#share-link-modal");
+const shareLinkBackdrop = shareLinkModal.querySelector(".modal__backdrop");
+const shareLinkInput = document.querySelector("#share-link-input");
+const shareLinkCopyBtn = document.querySelector("#share-link-copy-btn");
+const shareLinkClose = document.querySelector("#share-link-close");
+const sharesModal = document.querySelector("#shares-modal");
+const sharesBackdrop = sharesModal.querySelector(".modal__backdrop");
+const sharesClose = document.querySelector("#shares-close");
+const sharesError = document.querySelector("#shares-error");
+const sharesEmpty = document.querySelector("#shares-empty");
+const sharesList = document.querySelector("#shares-list");
 
 settingsButton.addEventListener("click", openSettingsModal);
+sharesButton.addEventListener("click", openSharesModal);
 settingsForm.addEventListener("submit", submitSettings);
 settingsClose.addEventListener("click", closeSettingsModal);
 settingsCancel.addEventListener("click", closeSettingsModal);
 settingsBackdrop.addEventListener("click", closeSettingsModal);
+settingsCreatePublicUrl.addEventListener("click", createPublicUrl);
 disconnectButton.addEventListener("click", disconnectYouTube);
 if (resetButton) {
   resetButton.addEventListener("click", resetYouTubeSetup);
@@ -125,6 +161,10 @@ settingsKey.addEventListener("input", () => {
 });
 uploadButton.addEventListener("click", handlePrimaryAction);
 uploadInput.addEventListener("change", () => handleFileSelection(uploadInput.files?.[0]));
+searchToggle.addEventListener("click", openSearch);
+dataTableHead.addEventListener("click", handleSortClick);
+searchInput.addEventListener("input", handleSearchInput);
+searchInput.addEventListener("blur", handleSearchBlur);
 folderDropdownBtn.addEventListener("click", toggleFolderDropdown);
 folderDropdownPanel.addEventListener("click", handleFolderOptionClick);
 folderColorPicker.addEventListener("click", handleColorSwatchClick);
@@ -151,6 +191,12 @@ confirmClose.addEventListener("click", () => resolveConfirm(false));
 confirmCancel.addEventListener("click", () => resolveConfirm(false));
 confirmBackdrop.addEventListener("click", () => resolveConfirm(false));
 confirmSubmit.addEventListener("click", () => resolveConfirm(true));
+shareLinkClose.addEventListener("click", closeShareLinkModal);
+shareLinkBackdrop.addEventListener("click", closeShareLinkModal);
+shareLinkCopyBtn.addEventListener("click", handleShareLinkCopy);
+sharesClose.addEventListener("click", closeSharesModal);
+sharesBackdrop.addEventListener("click", closeSharesModal);
+sharesList.addEventListener("click", handleSharesListClick);
 document.addEventListener("keydown", handleGlobalKeydown);
 
 void bootstrap();
@@ -171,12 +217,16 @@ async function bootstrap() {
 }
 
 async function refreshSettings() {
-  const payload = await fetchJson("/api/settings/youtube", undefined, "Could not load YouTube settings.");
+  const [youtubePayload, appPayload] = await Promise.all([
+    fetchJson("/api/settings/youtube", undefined, "Could not load YouTube settings."),
+    fetchJson("/api/settings/app", undefined, "Could not load app settings."),
+  ]);
   state.settings = {
-    configured: Boolean(payload.configured),
-    client_id: payload.client_id || "",
-    has_client_secret: Boolean(payload.has_client_secret),
-    source: payload.source || "none",
+    configured: Boolean(youtubePayload.configured),
+    client_id: youtubePayload.client_id || "",
+    has_client_secret: Boolean(youtubePayload.has_client_secret),
+    source: youtubePayload.source || "none",
+    public_app_url: appPayload.public_app_url || "",
   };
 }
 
@@ -236,6 +286,7 @@ function renderViews() {
   normalizeViewState();
   renderFolderSelect();
   renderFolderActions();
+  renderSortHeaders();
   renderFiles();
   persistViewState();
 }
@@ -332,6 +383,7 @@ function handleFolderOptionClick(event) {
 
   state.currentFolderId = folderId;
   state.editingVideoId = "";
+  closeSearch();
   renderViews();
 }
 
@@ -339,6 +391,31 @@ function handleOutsideClick(event) {
   if (!state.folderDropdownOpen) return;
   if (folderDropdown.contains(event.target)) return;
   closeFolderDropdown();
+}
+
+function openSearch() {
+  const w = folderDropdownBtn.offsetWidth;
+  appbarSearch.style.setProperty("--search-width", `${w}px`);
+  appbarSearch.classList.add("is-open");
+  window.setTimeout(() => searchInput.focus(), 20);
+}
+
+function closeSearch() {
+  state.searchQuery = "";
+  searchInput.value = "";
+  appbarSearch.classList.remove("is-open");
+  renderFiles();
+}
+
+function handleSearchInput() {
+  state.searchQuery = searchInput.value;
+  renderFiles();
+}
+
+function handleSearchBlur() {
+  if (!state.searchQuery) {
+    closeSearch();
+  }
 }
 
 function getFolderColorId(folderId) {
@@ -431,8 +508,11 @@ function updateColorPickerUI() {
 
 function renderFiles() {
   const visibleFiles = getVisibleFiles();
+  const showPending = state.pendingUpload !== null && state.pendingUpload.folderId === state.currentFolderId;
+  const hasTimers = showPending || state.downloadingVideoId !== "" || state.sharingVideoId !== "";
 
-  if (visibleFiles.length === 0) {
+  if (visibleFiles.length === 0 && !showPending) {
+    stopTimerInterval();
     dataTable.hidden = true;
     filesList.innerHTML = "";
     emptyState.hidden = false;
@@ -455,7 +535,32 @@ function renderFiles() {
 
   dataTable.hidden = false;
   emptyState.hidden = true;
-  filesList.innerHTML = visibleFiles.map((file) => renderFileRow(file)).join("");
+  const pendingHtml = showPending ? renderPendingRow(state.pendingUpload) : "";
+  filesList.innerHTML = pendingHtml + visibleFiles.map((file) => renderFileRow(file)).join("");
+
+  if (hasTimers) {
+    startTimerInterval();
+  } else {
+    stopTimerInterval();
+  }
+}
+
+function renderPendingRow(pending) {
+  const name = pending.name || "Uploading…";
+  const startTime = pending.startTime;
+  return `
+    <article class="file-row file-row--pending" data-video-id="__pending__">
+      <div class="file-cell">
+        <div class="file-name" title="${escapeHtml(name)}">${escapeHtml(displayName(name))}</div>
+      </div>
+      <div class="file-value">—</div>
+      <div class="file-value">—</div>
+      <div class="file-value">—</div>
+      <div class="file-download-cell">
+        <span class="runtime-timer" data-start-time="${startTime}">${formatRuntime(Date.now() - startTime)}</span>
+      </div>
+    </article>
+  `;
 }
 
 function renderFileRow(file) {
@@ -463,11 +568,26 @@ function renderFileRow(file) {
   const shownName = file?.display_name || rawName;
   const isEditing = file.video_id === state.editingVideoId;
   const isSelected = file.video_id === state.selectedVideoId;
+  const isDownloading = file.video_id === state.downloadingVideoId;
+  const isSharing = file.video_id === state.sharingVideoId;
   const renameValue = file.display_name_override || rawName;
-  const actionLabel = isSelected ? "Delete" : "Download";
-  const actionType = isSelected ? "delete" : "download";
-  const actionClassName = isSelected ? "file-link file-link--danger" : "file-link";
-  const actionIcon = isSelected ? deleteIconMarkup() : downloadIconMarkup();
+  let primaryBtn;
+  if (isDownloading) {
+    primaryBtn = `<button class="file-link file-link--timer" type="button" disabled aria-label="Downloading"><span class="runtime-timer" data-start-time="${state.downloadStartTime}">${formatRuntime(Date.now() - state.downloadStartTime)}</span></button>`;
+  } else if (isSelected) {
+    primaryBtn = `<button class="file-link file-link--danger" type="button" title="Delete" aria-label="Delete" data-action="delete" data-video-id="${escapeHtml(file.video_id)}">${deleteIconMarkup()}</button>`;
+  } else {
+    primaryBtn = `<button class="file-link" type="button" title="Download" aria-label="Download" data-action="download" data-video-id="${escapeHtml(file.video_id)}">${downloadIconMarkup()}</button>`;
+  }
+  const shareBtn = isSharing
+    ? `<button class="file-link file-link--timer" type="button" disabled aria-label="Sharing"><span class="runtime-timer" data-start-time="${state.sharingStartTime}">${formatRuntime(Date.now() - state.sharingStartTime)}</span></button>`
+    : `<button class="file-link" type="button" title="Share" aria-label="Share" data-action="share" data-video-id="${escapeHtml(file.video_id)}">${shareIconMarkup()}</button>`;
+  const actionsCell = `
+    <div class="file-actions">
+      ${primaryBtn}
+      ${shareBtn}
+    </div>
+  `;
   return `
     <article class="file-row${isSelected ? " is-selected" : ""}" data-video-id="${escapeHtml(file.video_id)}">
       <div class="file-cell">
@@ -490,18 +610,7 @@ function renderFileRow(file) {
       <div class="file-value">${escapeHtml(fileTypeLabel(file))}</div>
       <div class="file-value">${escapeHtml(formatBytes(file.original_size))}</div>
       <div class="file-value">${escapeHtml(formatDate(file.uploaded_at))}</div>
-      <div class="file-download-cell">
-        <button
-          class="${actionClassName}"
-          type="button"
-          title="${actionLabel}"
-          aria-label="${actionLabel}"
-          data-action="${actionType}"
-          data-video-id="${escapeHtml(file.video_id)}"
-        >
-          ${actionIcon}
-        </button>
-      </div>
+      <div class="file-download-cell">${actionsCell}</div>
     </article>
   `;
 }
@@ -524,20 +633,24 @@ function handleFilesListClick(event) {
     return;
   }
 
-  const actionTarget = target.closest("[data-action='download'], [data-action='delete']");
+  const actionTarget = target.closest("[data-action='download'], [data-action='delete'], [data-action='share']");
   if (actionTarget instanceof HTMLElement) {
     if (state.busy) {
       return;
     }
 
     const videoId = actionTarget.dataset.videoId || "";
-    if (!videoId) {
-      setFlash("error", "Missing YouTube file id.");
+    if (!videoId || videoId === "__pending__") {
       return;
     }
 
     if (actionTarget.dataset.action === "delete") {
       void handleDeleteFile(videoId);
+      return;
+    }
+
+    if (actionTarget.dataset.action === "share") {
+      void handleShareFile(videoId);
       return;
     }
 
@@ -555,7 +668,7 @@ function handleFilesListClick(event) {
   }
 
   const videoId = row.dataset.videoId || "";
-  if (!videoId) {
+  if (!videoId || videoId === "__pending__") {
     return;
   }
 
@@ -573,7 +686,12 @@ function handleFilesListDoubleClick(event) {
     return;
   }
 
-  if (target.closest("[data-action='download']") || target.closest("[data-action='delete']") || target.closest("[data-action='rename-input']")) {
+  if (
+    target.closest("[data-action='download']") ||
+    target.closest("[data-action='delete']") ||
+    target.closest("[data-action='share']") ||
+    target.closest("[data-action='rename-input']")
+  ) {
     return;
   }
 
@@ -583,7 +701,7 @@ function handleFilesListDoubleClick(event) {
   }
 
   const videoId = row.dataset.videoId || "";
-  if (!videoId) {
+  if (!videoId || videoId === "__pending__") {
     return;
   }
 
@@ -630,6 +748,24 @@ function handleGlobalKeydown(event) {
   if (!confirmModal.hidden) {
     event.preventDefault();
     resolveConfirm(false);
+    return;
+  }
+
+  if (!shareLinkModal.hidden) {
+    event.preventDefault();
+    closeShareLinkModal();
+    return;
+  }
+
+  if (!sharesModal.hidden) {
+    event.preventDefault();
+    closeSharesModal();
+    return;
+  }
+
+  if (state.searchQuery || appbarSearch.classList.contains("is-open")) {
+    event.preventDefault();
+    closeSearch();
     return;
   }
 
@@ -701,7 +837,9 @@ async function handleFileSelection(file) {
   }
 
   state.busy = true;
+  state.pendingUpload = { name: file.name, folderId: state.currentFolderId, startTime: Date.now() };
   renderPrimaryAction();
+  renderFiles();
   clearFlash();
   setJobProgress(2, "Preparing");
 
@@ -713,11 +851,14 @@ async function handleFileSelection(file) {
     const fallbackFile = job.metadata?.remote_file || null;
     setJobProgress(100, "Done");
     setFlash("success", job.metadata?.original_filename || file.name);
+    state.pendingUpload = null;
     await refreshLibrary({ fallbackFile });
     window.setTimeout(hideJobProgress, 1000);
   } catch (error) {
     hideJobProgress();
+    state.pendingUpload = null;
     setFlash("error", error.message || "Upload failed.");
+    renderFiles();
   } finally {
     key = "";
     state.busy = false;
@@ -737,7 +878,10 @@ async function handleRemoteDownload(videoId) {
   }
 
   state.busy = true;
+  state.downloadingVideoId = videoId;
+  state.downloadStartTime = Date.now();
   renderPrimaryAction();
+  renderFiles();
   clearFlash();
   setJobProgress(2, "Preparing");
 
@@ -757,7 +901,57 @@ async function handleRemoteDownload(videoId) {
   } finally {
     key = "";
     state.busy = false;
+    state.downloadingVideoId = "";
+    state.downloadStartTime = 0;
     renderPrimaryAction();
+    renderFiles();
+  }
+}
+
+async function handleShareFile(videoId) {
+  if (!state.library.connected) {
+    setFlash("error", "Connect YouTube.");
+    return;
+  }
+
+  if (!state.settings.public_app_url) {
+    setFlash("error", "Create or save a Public App URL before sharing files.");
+    openSettingsModal();
+    return;
+  }
+
+  let key = await resolveOperationalKey();
+  if (!key) {
+    return;
+  }
+
+  state.busy = true;
+  state.sharingVideoId = videoId;
+  state.sharingStartTime = Date.now();
+  renderPrimaryAction();
+  renderFiles();
+  clearFlash();
+  setJobProgress(2, "Preparing");
+
+  try {
+    const jobId = await createShareRequest(videoId, key);
+    key = "";
+    const job = await pollJob(jobId);
+    const shareUrl = job.metadata?.share_url || "";
+    const copied = await copyToClipboard(shareUrl).catch(() => false);
+    void refreshShares().catch(() => {});
+    openShareLinkModal(shareUrl, copied);
+    window.setTimeout(hideJobProgress, 1000);
+  } catch (error) {
+    hideJobProgress();
+    setFlash("error", error.message || "Could not share file.");
+  } finally {
+    key = "";
+    state.busy = false;
+    state.sharingVideoId = "";
+    state.sharingStartTime = 0;
+    renderPrimaryAction();
+    renderFiles();
   }
 }
 
@@ -835,6 +1029,39 @@ async function startRemoteDownload(videoId, key) {
   return payload.job_id;
 }
 
+async function createShareRequest(videoId, key) {
+  const payload = await fetchJson(
+    `/api/library/files/${encodeURIComponent(videoId)}/share`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        key,
+      }),
+    },
+    "Could not share file.",
+  );
+  return payload.job_id;
+}
+
+async function startShareExtension(token, key) {
+  return fetchJson(
+    `/api/library/shares/${encodeURIComponent(token)}/extend`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        key,
+      }),
+    },
+    "Could not extend link.",
+  );
+}
+
 async function pollJob(jobId) {
   while (true) {
     const payload = await fetchJson(`/api/jobs/${jobId}`, undefined, "Could not fetch job status.");
@@ -881,6 +1108,7 @@ async function resetYouTubeSetup() {
       client_id: payload.settings?.client_id || "",
       has_client_secret: Boolean(payload.settings?.has_client_secret),
       source: payload.settings?.source || "none",
+      public_app_url: state.settings.public_app_url || "",
     };
     closeSettingsModal();
     setFlash("success", "Reset local YouTube setup");
@@ -899,6 +1127,7 @@ function openSettingsModal() {
   settingsClientId.value = state.settings.client_id || "";
   settingsClientSecret.value = "";
   settingsClientSecret.placeholder = state.settings.has_client_secret ? "Saved" : "";
+  settingsPublicAppUrl.value = state.settings.public_app_url || "";
   renderSettingsActions();
   hideSettingsError();
   window.setTimeout(() => settingsKey.focus(), 20);
@@ -908,6 +1137,7 @@ function closeSettingsModal() {
   state.settingsOpen = false;
   settingsModal.hidden = true;
   settingsClientSecret.value = "";
+  settingsPublicAppUrl.value = "";
   hideSettingsError();
   syncBodyModalState();
   restorePreviousFocus();
@@ -919,7 +1149,9 @@ async function submitSettings(event) {
   const keyValue = settingsKey.value.trim();
   const clientId = settingsClientId.value.trim();
   const clientSecret = settingsClientSecret.value.trim();
+  const publicAppUrl = settingsPublicAppUrl.value.trim();
   const settingsChanged = clientSecret !== "" || clientId !== (state.settings.client_id || "");
+  const appSettingsChanged = publicAppUrl !== (state.settings.public_app_url || "");
 
   if (keyValue && !KEY_PATTERN.test(keyValue)) {
     showSettingsError("Encryption key must be exactly 24 digits or left empty.");
@@ -954,7 +1186,31 @@ async function submitSettings(event) {
         client_id: payload.client_id || "",
         has_client_secret: Boolean(payload.has_client_secret),
         source: payload.source || "runtime",
+        public_app_url: state.settings.public_app_url || "",
       };
+    } catch (error) {
+      showSettingsError(error.message || "Could not save settings.");
+      return;
+    }
+  }
+
+  if (appSettingsChanged) {
+    try {
+      const payload = await fetchJson(
+        "/api/settings/app",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            public_app_url: publicAppUrl,
+          }),
+        },
+        "Could not save settings.",
+      );
+
+      state.settings.public_app_url = payload.public_app_url || "";
     } catch (error) {
       showSettingsError(error.message || "Could not save settings.");
       return;
@@ -967,15 +1223,321 @@ async function submitSettings(event) {
 
   closeSettingsModal();
 
-  if (!settingsChanged && !keyValue) {
+  if (!settingsChanged && !appSettingsChanged && !keyValue) {
     return;
   }
 
   setFlash("success", "Settings saved");
 
-  if (settingsChanged) {
+  if (settingsChanged || appSettingsChanged) {
     await refreshLibrary();
   }
+}
+
+async function createPublicUrl() {
+  settingsCreatePublicUrl.disabled = true;
+  hideSettingsError();
+
+  try {
+    const payload = await fetchJson(
+      "/api/settings/app/public-url/quick-tunnel",
+      {
+        method: "POST",
+      },
+      "Could not create a public URL.",
+    );
+
+    state.settings.public_app_url = payload.public_app_url || "";
+    settingsPublicAppUrl.value = state.settings.public_app_url;
+    setFlash("success", "Public URL created");
+  } catch (error) {
+    showSettingsError(error.message || "Could not create a public URL.");
+  } finally {
+    settingsCreatePublicUrl.disabled = false;
+  }
+}
+
+async function openSharesModal() {
+  state.previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  state.linksOpen = true;
+  sharesModal.hidden = false;
+  document.body.classList.add("is-modal-open");
+  hideSharesError();
+  renderSharesModal();
+
+  try {
+    await refreshShares();
+    startSharesPolling();
+  } catch (error) {
+    showSharesError(error.message || "Could not load links.");
+  }
+}
+
+function closeSharesModal() {
+  state.linksOpen = false;
+  stopSharesPolling();
+  sharesModal.hidden = true;
+  hideSharesError();
+  syncBodyModalState();
+  restorePreviousFocus();
+}
+
+async function refreshShares() {
+  state.linksLoading = true;
+  renderSharesModal();
+
+  try {
+    const payload = await fetchJson("/api/library/shares", undefined, "Could not load links.");
+    state.links = Array.isArray(payload.shares) ? payload.shares : [];
+    hideSharesError();
+  } finally {
+    state.linksLoading = false;
+    renderSharesModal();
+  }
+}
+
+function renderSharesModal() {
+  const visibleShares = getVisibleShares();
+
+  if (state.linksLoading) {
+    sharesEmpty.hidden = true;
+    sharesList.innerHTML = `<div class="links-empty">Loading</div>`;
+    return;
+  }
+
+  if (visibleShares.length === 0) {
+    sharesList.innerHTML = "";
+    sharesEmpty.hidden = false;
+    return;
+  }
+
+  sharesEmpty.hidden = true;
+  sharesList.innerHTML = visibleShares.map((share) => renderShareAdminCard(share)).join("");
+}
+
+function getVisibleShares() {
+  if (!Array.isArray(state.links)) {
+    return [];
+  }
+
+  return state.links.filter((share) => ["active", "pending", "used"].includes(share?.status || ""));
+}
+
+function startSharesPolling() {
+  stopSharesPolling();
+  state.linksPollTimer = window.setInterval(() => {
+    if (!state.linksOpen || state.linksLoading) {
+      return;
+    }
+    void refreshShares().catch(() => {});
+  }, 3000);
+}
+
+function stopSharesPolling() {
+  if (!state.linksPollTimer) {
+    return;
+  }
+  window.clearInterval(state.linksPollTimer);
+  state.linksPollTimer = null;
+}
+
+function renderShareAdminCard(share) {
+  const downloads = Array.isArray(share.downloads) ? share.downloads : [];
+  const canCopy = Boolean(share.share_url) && ["active", "pending"].includes(share.status);
+  const canRevoke = ["active", "pending"].includes(share.status);
+  const isInactive = ["expired", "revoked", "invalid"].includes(share.status);
+  const dlCount = share.download_count || 0;
+  const metaParts = [
+    formatShortDate(share.created_at || ""),
+    `Exp. ${formatShortDate(share.expires_at || "")}`,
+    `${dlCount} ${dlCount === 1 ? "download" : "downloads"}`,
+  ];
+
+  return `
+    <article class="link-card${isInactive ? " link-card--inactive" : ""}" data-share-token="${escapeHtml(share.token || "")}">
+      <div class="link-card__head">
+        <div class="link-card__info">
+          <span class="link-card__name">${escapeHtml(share.display_name || share.original_filename || "Shared file")}</span>
+          <span class="link-card__meta">${escapeHtml(metaParts.join(" · "))}</span>
+        </div>
+        ${renderShareAdminStatus(share)}
+      </div>
+
+      <div class="link-card__url">
+        <input class="field-input link-card__url-input" type="url" readonly value="${escapeHtml(share.share_url || "")}" />
+        <button class="btn btn--ghost" type="button" data-action="copy-share-link" data-token="${escapeHtml(share.token || "")}" ${canCopy ? "" : "disabled"}>Copy</button>
+        ${canRevoke ? `<button class="btn btn--danger" type="button" data-action="revoke-share" data-token="${escapeHtml(share.token || "")}">Revoke</button>` : ""}
+      </div>
+
+      ${downloads.length ? `<div class="link-card__history">${downloads.map((d) => renderShareDownloadRow(d)).join("")}</div>` : ""}
+    </article>
+  `;
+}
+
+function renderShareAdminStatus(share) {
+  const status = share.status || "invalid";
+  const label = shareStatusLabel(status);
+
+  if (status !== "used") {
+    return `<span class="share-admin-status share-admin-status--${escapeHtml(status)}">${escapeHtml(label)}</span>`;
+  }
+
+  const disabled = state.busy || state.extendingShareToken === share.token;
+  const ariaLabel = `Allow one more download for ${share.display_name || share.original_filename || "this file"}`;
+
+  return `
+    <button
+      class="share-admin-status share-admin-status--used share-admin-status--action"
+      type="button"
+      data-action="extend-share"
+      data-token="${escapeHtml(share.token || "")}"
+      aria-label="${escapeHtml(ariaLabel)}"
+      title="Allow one more download"
+      ${disabled ? "disabled" : ""}
+    >${escapeHtml(label)}</button>
+  `;
+}
+
+function renderShareDownloadRow(download) {
+  return `
+    <div class="link-history-row">
+      <span class="link-history-row__time">${escapeHtml(formatDate(download.downloaded_at || ""))}</span>
+      <span class="link-history-row__ip">${escapeHtml(download.ip_address || "—")}</span>
+      <span class="link-history-row__ua">${escapeHtml(download.user_agent || "Unknown")}</span>
+    </div>
+  `;
+}
+
+function shareStatusLabel(status) {
+  const labels = {
+    active: "Active",
+    pending: "Pending",
+    revoked: "Revoked",
+    expired: "Expired",
+    used: "Used",
+    invalid: "Invalid",
+  };
+  return labels[status] || "Unknown";
+}
+
+async function handleSharesListClick(event) {
+  const actionTarget = event.target instanceof Element ? event.target.closest("[data-action][data-token]") : null;
+  if (!(actionTarget instanceof HTMLElement)) {
+    return;
+  }
+
+  const token = actionTarget.dataset.token || "";
+  const share = state.links.find((item) => item.token === token);
+  if (!share) {
+    return;
+  }
+
+  if (actionTarget.dataset.action === "copy-share-link") {
+    const copied = await copyToClipboard(share.share_url || "").catch(() => false);
+    if (copied) {
+      actionTarget.textContent = "Copied!";
+      actionTarget.classList.add("is-copied");
+      actionTarget.disabled = true;
+      window.setTimeout(() => {
+        if (actionTarget.isConnected) {
+          actionTarget.textContent = "Copy";
+          actionTarget.classList.remove("is-copied");
+          actionTarget.disabled = false;
+        }
+      }, 2000);
+      return;
+    }
+    openShareLinkModal(share.share_url || "", false);
+    return;
+  }
+
+  if (actionTarget.dataset.action === "extend-share") {
+    await handleExtendShare(share);
+    return;
+  }
+
+  if (actionTarget.dataset.action === "revoke-share") {
+    await handleRevokeShare(share);
+  }
+}
+
+async function handleExtendShare(share) {
+  if (state.busy) {
+    return;
+  }
+
+  let key = await resolveOperationalKey();
+  if (!key) {
+    return;
+  }
+
+  state.busy = true;
+  state.extendingShareToken = share.token;
+  hideSharesError();
+  clearFlash();
+  renderPrimaryAction();
+  renderSharesModal();
+  setJobProgress(2, "Preparing");
+
+  try {
+    const payload = await startShareExtension(share.token, key);
+    if (payload.share) {
+      state.links = state.links.map((item) => (item.token === share.token ? payload.share : item));
+      renderSharesModal();
+    }
+
+    key = "";
+    await pollJob(payload.job_id);
+    await refreshShares();
+    setFlash("success", "Link extended");
+    window.setTimeout(hideJobProgress, 1000);
+  } catch (error) {
+    hideJobProgress();
+    await refreshShares().catch(() => {});
+    showSharesError(error.message || "Could not extend link.");
+  } finally {
+    key = "";
+    state.busy = false;
+    state.extendingShareToken = "";
+    renderPrimaryAction();
+    renderSharesModal();
+  }
+}
+
+async function handleRevokeShare(share) {
+  const confirmed = await promptConfirm({
+    title: "Revoke link",
+    message: `Revoke "${share.display_name || share.original_filename}"?`,
+    confirmLabel: "Revoke",
+    destructive: true,
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    await fetchJson(
+      `/api/library/shares/${encodeURIComponent(share.token)}/revoke`,
+      {
+        method: "POST",
+      },
+      "Could not revoke link.",
+    );
+    setFlash("success", "Link revoked");
+    await refreshShares();
+  } catch (error) {
+    showSharesError(error.message || "Could not revoke link.");
+  }
+}
+
+function showSharesError(message) {
+  sharesError.hidden = false;
+  sharesError.textContent = message;
+}
+
+function hideSharesError() {
+  sharesError.hidden = true;
+  sharesError.textContent = "";
 }
 
 function startInlineRename(videoId) {
@@ -1214,6 +1776,84 @@ async function startBrowserDownload(url, filename) {
   link.click();
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+async function copyToClipboard(value) {
+  if (!value) {
+    throw new Error("Could not copy the share link.");
+  }
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Fall through to legacy copy methods when the browser blocks Clipboard API access.
+    }
+  }
+
+  const field = document.createElement("textarea");
+  field.value = value;
+  field.setAttribute("readonly", "true");
+  field.style.position = "fixed";
+  field.style.opacity = "0";
+  document.body.append(field);
+  field.select();
+  field.setSelectionRange(0, field.value.length);
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  }
+  field.remove();
+
+  if (!copied) {
+    return false;
+  }
+
+  return true;
+}
+
+function openShareLinkModal(url, alreadyCopied = false) {
+  state.shareLinkOpen = true;
+  shareLinkModal.hidden = false;
+  shareLinkInput.value = url;
+  document.body.classList.add("is-modal-open");
+  shareLinkCopyBtn.disabled = false;
+  shareLinkCopyBtn.textContent = alreadyCopied ? "Copied!" : "Copy";
+  if (alreadyCopied) {
+    window.setTimeout(() => {
+      if (!shareLinkModal.hidden) {
+        shareLinkCopyBtn.textContent = "Copy";
+      }
+    }, 2000);
+  }
+  window.setTimeout(() => {
+    shareLinkInput.focus();
+    shareLinkInput.select();
+  }, 20);
+}
+
+function closeShareLinkModal() {
+  state.shareLinkOpen = false;
+  shareLinkModal.hidden = true;
+  shareLinkInput.value = "";
+  shareLinkCopyBtn.textContent = "Copy";
+  syncBodyModalState();
+}
+
+async function handleShareLinkCopy() {
+  const url = shareLinkInput.value;
+  const copied = await copyToClipboard(url).catch(() => false);
+  if (copied) {
+    shareLinkCopyBtn.textContent = "Copied!";
+    window.setTimeout(() => {
+      if (!shareLinkModal.hidden) {
+        shareLinkCopyBtn.textContent = "Copy";
+      }
+    }, 2000);
+  }
 }
 
 function showFlashFromQuery() {
@@ -1575,7 +2215,81 @@ function buildFolderChildMap() {
 }
 
 function getVisibleFiles() {
-  return state.library.files.filter((file) => file.folder_id === state.currentFolderId);
+  const files = state.library.files.filter((file) => file.folder_id === state.currentFolderId);
+  const q = state.searchQuery.trim().toLowerCase();
+  const filtered = q ? files.filter((file) => (file.display_name || file.original_filename).toLowerCase().includes(q)) : files;
+  return sortFiles(filtered);
+}
+
+function sortFiles(files) {
+  const { sortKey, sortDir } = state;
+  const dir = sortDir === "asc" ? 1 : -1;
+  return [...files].sort((a, b) => {
+    switch (sortKey) {
+      case "name": {
+        const an = (a.display_name || a.original_filename).toLowerCase();
+        const bn = (b.display_name || b.original_filename).toLowerCase();
+        return dir * an.localeCompare(bn);
+      }
+      case "type":
+        return dir * fileTypeLabel(a).localeCompare(fileTypeLabel(b));
+      case "size":
+        return dir * (a.original_size - b.original_size);
+      case "uploaded_at":
+        return dir * (a.uploaded_at || "").localeCompare(b.uploaded_at || "");
+      default:
+        return 0;
+    }
+  });
+}
+
+function handleSortClick(event) {
+  const btn = event.target instanceof Element ? event.target.closest(".col-sort") : null;
+  if (!btn) return;
+  const key = btn.dataset.sort;
+  if (!key) return;
+  if (state.sortKey === key) {
+    state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+  } else {
+    state.sortKey = key;
+    state.sortDir = key === "uploaded_at" ? "desc" : "asc";
+  }
+  renderSortHeaders();
+  renderFiles();
+}
+
+function renderSortHeaders() {
+  for (const btn of dataTableHead.querySelectorAll(".col-sort")) {
+    const isActive = btn.dataset.sort === state.sortKey;
+    btn.classList.toggle("is-active", isActive);
+    btn.classList.toggle("is-asc", isActive && state.sortDir === "asc");
+  }
+}
+
+function formatRuntime(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function startTimerInterval() {
+  if (state.timerInterval) return;
+  state.timerInterval = window.setInterval(tickTimers, 1000);
+}
+
+function stopTimerInterval() {
+  if (!state.timerInterval) return;
+  window.clearInterval(state.timerInterval);
+  state.timerInterval = null;
+}
+
+function tickTimers() {
+  const now = Date.now();
+  for (const el of filesList.querySelectorAll(".runtime-timer[data-start-time]")) {
+    const start = Number(el.dataset.startTime) || 0;
+    el.textContent = formatRuntime(now - start);
+  }
 }
 
 function setFlash(type, message, source = "general") {
@@ -1616,6 +2330,13 @@ function formatBytes(value) {
     unitIndex += 1;
   }
   return `${current.toFixed(current >= 100 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatShortDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
 }
 
 function formatDate(value) {
@@ -1696,7 +2417,7 @@ async function fetchJson(url, options, fallbackMessage) {
 }
 
 function syncBodyModalState() {
-  const anyModalOpen = state.settingsOpen || state.organizationOpen || state.confirmOpen || !keyModal.hidden;
+  const anyModalOpen = state.settingsOpen || state.organizationOpen || state.confirmOpen || state.shareLinkOpen || state.linksOpen || !keyModal.hidden;
   document.body.classList.toggle("is-modal-open", anyModalOpen);
 }
 
@@ -1730,6 +2451,15 @@ function downloadIconMarkup() {
       <path d="M12 4v10" />
       <path d="M8.5 10.5 12 14l3.5-3.5" />
       <path d="M5 18.5h14" />
+    </svg>
+  `;
+}
+
+function shareIconMarkup() {
+  return `
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
     </svg>
   `;
 }

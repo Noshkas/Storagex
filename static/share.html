@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StorageX — Shared file</title>
+    <link rel="icon" href="/static/favicon.svg?v=__ASSET_VERSION__" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/share.css?v=__ASSET_VERSION__" />
+    <script>window.__SHARE_PAGE__ = __SHARE_PAGE_DATA__;</script>
+    <script defer src="/static/share.js?v=__ASSET_VERSION__"></script>
+  </head>
+  <body>
+    <main class="share-shell">
+      <article class="share-card" aria-label="Shared file">
+
+        <header class="share-header">
+          <div class="share-brand">
+            <img src="/static/favicon.svg?v=__ASSET_VERSION__" class="share-brand__logo" alt="" aria-hidden="true" width="15" height="15" />
+            <span class="share-brand__name">StorageX</span>
+          </div>
+          <span id="share-badge" class="share-badge">Share</span>
+        </header>
+
+        <div class="share-body">
+          <div id="share-file-icon" class="share-file-icon" aria-hidden="true">
+            <span id="share-type" class="share-file-icon__ext">FILE</span>
+          </div>
+
+          <h1 id="share-name" class="share-name">Shared file</h1>
+
+          <div class="share-meta">
+            <span class="share-meta__item">
+              <span class="share-meta__label">Size</span>
+              <strong id="share-size" class="share-meta__value">—</strong>
+            </span>
+            <span class="share-meta__dot" aria-hidden="true"></span>
+            <span class="share-meta__item">
+              <span class="share-meta__label">Expires</span>
+              <strong id="share-expiry" class="share-meta__value">—</strong>
+            </span>
+          </div>
+
+          <a id="share-download" class="share-download-btn" href="#">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 4v12" /><path d="M8.5 12.5 12 16l3.5-3.5" /><path d="M5 19h14" />
+            </svg>
+            Download file
+          </a>
+
+          <p id="share-message" class="share-message" hidden></p>
+        </div>
+
+      </article>
+    </main>
+  </body>
+</html>

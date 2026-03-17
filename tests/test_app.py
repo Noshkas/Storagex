@@ -15,6 +15,7 @@ from server.codec.constants import LEGACY_FORMAT_VERSION
 from server.codec.format import build_stream_with_manifest
 from server.codec.keyed import scramble_payload
 from server.codec.service import _render_frame_grid, _write_frame_png
+from server.share_store import ShareStore
 from server.codec.video import encode_frames_to_webm
 from server.youtube import (
     InMemoryYouTubeStore,
@@ -137,6 +138,25 @@ class FakeUnavailableYouTubeService(FakeYouTubeService):
         raise YouTubeError("Could not read the connected YouTube channel.")
 
 
+class FakeBrokenDownloadYouTubeService(FakeYouTubeService):
+    def download_video(self, *, video_id: str, output_dir: Path) -> Path:
+        del video_id, output_dir
+        raise YouTubeError("downstream failure")
+
+
+class FakeQuickTunnelManager:
+    def __init__(self, public_url: str = "https://fake-public.trycloudflare.com") -> None:
+        self.public_url = public_url
+        self.calls: list[str] = []
+
+    def ensure_started(self, *, local_url: str) -> str:
+        self.calls.append(local_url)
+        return self.public_url
+
+    def stop(self) -> None:
+        return
+
+
 class FakeCredentials:
     def to_json(self) -> str:
         return json.dumps(
@@ -195,6 +215,7 @@ def test_api_encode_then_decode_flow(isolated_jobs_dir) -> None:
         video_response = client.get(encode_job["artifacts"]["video"])
         assert video_response.status_code == 200
         assert video_response.content
+        assert [path for path in isolated_jobs_dir.iterdir() if path.is_dir()] == []
 
         decode_response = client.post(
             "/api/decode",
@@ -209,6 +230,7 @@ def test_api_encode_then_decode_flow(isolated_jobs_dir) -> None:
         recovered_response = client.get(decode_job["artifacts"]["recovered_file"])
         assert recovered_response.status_code == 200
         assert recovered_response.content == b"hello from storagex\n" * 100
+        assert [path for path in isolated_jobs_dir.iterdir() if path.is_dir()] == []
 
 
 def test_api_decode_with_wrong_key_downloads_corrupted_file(isolated_jobs_dir) -> None:
@@ -224,6 +246,7 @@ def test_api_decode_with_wrong_key_downloads_corrupted_file(isolated_jobs_dir) -
 
         video_response = client.get(encode_job["artifacts"]["video"])
         assert video_response.status_code == 200
+        assert [path for path in isolated_jobs_dir.iterdir() if path.is_dir()] == []
 
         decode_response = client.post(
             "/api/decode",
@@ -239,6 +262,7 @@ def test_api_decode_with_wrong_key_downloads_corrupted_file(isolated_jobs_dir) -
         assert recovered_response.status_code == 200
         assert len(recovered_response.content) == len(source_bytes)
         assert recovered_response.content != source_bytes
+        assert [path for path in isolated_jobs_dir.iterdir() if path.is_dir()] == []
 
 
 def test_api_decode_accepts_legacy_webm_upload(isolated_jobs_dir) -> None:
@@ -508,6 +532,114 @@ def test_settings_can_be_saved_at_runtime(isolated_jobs_dir, monkeypatch) -> Non
         assert upload_response.json()["detail"] == "Connect YouTube before uploading files."
 
 
+def test_app_settings_can_be_saved_at_runtime(isolated_jobs_dir) -> None:
+    with TestClient(server_app.app) as client:
+        response = client.get("/api/settings/app")
+        assert response.status_code == 200
+        assert response.json() == {"configured": False, "public_app_url": ""}
+
+        save_response = client.post(
+            "/api/settings/app",
+            json={"public_app_url": "https://files.example.com"},
+        )
+        assert save_response.status_code == 200
+        assert save_response.json() == {
+            "configured": True,
+            "public_app_url": "https://files.example.com",
+        }
+
+
+def test_quick_tunnel_endpoint_creates_and_saves_public_url(isolated_jobs_dir, monkeypatch) -> None:
+    fake_tunnel = FakeQuickTunnelManager()
+    monkeypatch.setattr(server_app, "quick_tunnel_manager", fake_tunnel)
+
+    with TestClient(server_app.app) as client:
+        response = client.post("/api/settings/app/public-url/quick-tunnel")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "configured": True,
+        "public_app_url": "https://fake-public.trycloudflare.com",
+    }
+    assert fake_tunnel.calls == ["http://127.0.0.1:8000"]
+
+
+def test_create_share_requires_public_app_url(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 16, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+
+        response = client.post(f"/api/library/files/{video_id}/share", json={"key": VALID_KEY})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Create or save a Public App URL in Settings before sharing files."
+
+
+def test_create_share_prepares_share_and_returns_job(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 16, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+
+        response = client.post(f"/api/library/files/{video_id}/share", json={"key": VALID_KEY})
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "queued"
+        share_job = _wait_for_completion(client, payload["job_id"])
+
+    assert share_job["status"] == "completed"
+    assert share_job["metadata"]["share_url"].startswith("https://files.example.com/s/")
+
+
+def test_share_persists_across_restart_and_rejects_expired_token(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 8, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        share_response = client.post(f"/api/library/files/{video_id}/share", json={"key": VALID_KEY})
+        share_job = _wait_for_completion(client, share_response.json()["job_id"])
+        token = share_job["metadata"]["share_url"].rsplit("/", 1)[-1]
+
+    shares_path = server_app.share_store._path
+    payload = json.loads(shares_path.read_text(encoding="utf-8"))
+    payload["shares"][token]["expires_at"] = "2026-03-01T00:00:00Z"
+    shares_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    monkeypatch.setattr(server_app, "share_store", ShareStore(shares_path))
+
+    with TestClient(server_app.app) as client:
+        page_response = client.get(f"/s/{token}")
+        download_response = client.get(f"/api/shares/{token}/download")
+
+    assert page_response.status_code == 410
+    assert "expired" in page_response.text.lower()
+    assert download_response.status_code == 410
+    assert download_response.json()["detail"] == "This share link has expired."
+
+
 def test_local_youtube_reset_clears_saved_runtime_state(isolated_jobs_dir, monkeypatch) -> None:
     fake_youtube = FakeYouTubeService(configured=True, connected=True)
     monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
@@ -610,7 +742,7 @@ def test_api_uploads_to_youtube_and_cleans_temp_files(isolated_jobs_dir, monkeyp
         library_payload = library_response.json()
         assert len(library_payload["files"]) == 1
         assert library_payload["files"][0]["video_id"] == "video-1"
-        assert list(isolated_jobs_dir.iterdir()) == []
+        assert [path for path in isolated_jobs_dir.iterdir() if path.is_dir()] == []
 
 
 def test_api_upload_requires_connected_youtube(isolated_jobs_dir, monkeypatch) -> None:
@@ -655,6 +787,283 @@ def test_api_downloads_and_recovers_youtube_file(isolated_jobs_dir, monkeypatch)
         recovered_response = client.get(download_job["artifacts"]["recovered_file"])
         assert recovered_response.status_code == 200
         assert recovered_response.content == source_bytes
+        assert list(isolated_jobs_dir.iterdir()) == []
+
+
+def test_share_prepare_with_wrong_owner_key_fails_without_exposing_download(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 12, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        bad_job, bad_token = _create_share_and_wait(client, video_id, key=WRONG_KEY)
+        good_job, good_token = _create_share_and_wait(client, video_id, key=VALID_KEY)
+
+    assert bad_job["status"] == "failed"
+    assert bad_job["error"] == "That key does not unlock this file."
+    assert bad_job["metadata"]["share_url"].endswith(f"/s/{bad_token}")
+    assert good_job["status"] == "completed"
+    assert good_job["metadata"]["share_url"].endswith(f"/s/{good_token}")
+    assert bad_token != good_token
+
+
+def test_share_download_logs_ip_and_marks_link_used(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+    source_bytes = b"hello from storagex\n" * 10
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", source_bytes, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        share_job, token = _create_share_and_wait(client, video_id)
+        artifact_dir = Path(server_app.DATA_DIR) / "share-artifacts" / token
+        first_response = client.get(
+            f"/api/shares/{token}/download",
+            headers={"cf-connecting-ip": "203.0.113.10"},
+        )
+        second_response = client.get(
+            f"/api/shares/{token}/download",
+            headers={"x-forwarded-for": "198.51.100.24"},
+        )
+        owner_shares = client.get("/api/library/shares")
+
+    assert share_job["status"] == "completed"
+    assert first_response.status_code == 200
+    assert first_response.content == source_bytes
+    assert second_response.status_code == 410
+    assert second_response.json()["detail"] == "This share link has already been used."
+    assert owner_shares.status_code == 200
+    share_payload = _share_from_owner_list(owner_shares.json()["shares"], token)
+    assert share_payload["status"] == "used"
+    assert share_payload["download_count"] == 1
+    assert share_payload["downloads"][0]["ip_address"] == "203.0.113.10"
+    assert artifact_dir.exists() is False
+
+
+def test_owner_can_extend_used_share_for_another_download(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+    source_bytes = b"hello from storagex\n" * 8
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", source_bytes, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        share_job, token = _create_share_and_wait(client, video_id)
+
+        first_response = client.get(
+            f"/api/shares/{token}/download",
+            headers={"cf-connecting-ip": "203.0.113.10"},
+        )
+        extend_response = client.post(f"/api/library/shares/{token}/extend", json={"key": VALID_KEY})
+        extend_job = _wait_for_completion(client, extend_response.json()["job_id"])
+        second_response = client.get(
+            f"/api/shares/{token}/download",
+            headers={"x-forwarded-for": "198.51.100.24"},
+        )
+        owner_shares = client.get("/api/library/shares")
+
+    assert share_job["status"] == "completed"
+    assert first_response.status_code == 200
+    assert first_response.content == source_bytes
+    assert extend_response.status_code == 200
+    assert extend_response.json()["share"]["status"] == "pending"
+    assert extend_job["status"] == "completed"
+    assert extend_job["metadata"]["share_url"].endswith(f"/s/{token}")
+    assert second_response.status_code == 200
+    assert second_response.content == source_bytes
+    assert owner_shares.status_code == 200
+    share_payload = _share_from_owner_list(owner_shares.json()["shares"], token)
+    assert share_payload["status"] == "used"
+    assert share_payload["download_count"] == 2
+    assert share_payload["downloads"][0]["ip_address"] == "198.51.100.24"
+    assert share_payload["downloads"][1]["ip_address"] == "203.0.113.10"
+
+
+def test_failed_share_extension_restores_used_link(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 8, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        _, token = _create_share_and_wait(client, video_id)
+
+        first_response = client.get(
+            f"/api/shares/{token}/download",
+            headers={"cf-connecting-ip": "203.0.113.10"},
+        )
+        extend_response = client.post(f"/api/library/shares/{token}/extend", json={"key": WRONG_KEY})
+        extend_job = _wait_for_completion(client, extend_response.json()["job_id"])
+        second_response = client.get(f"/api/shares/{token}/download")
+        owner_shares = client.get("/api/library/shares")
+
+    assert first_response.status_code == 200
+    assert extend_response.status_code == 200
+    assert extend_response.json()["share"]["status"] == "pending"
+    assert extend_job["status"] == "failed"
+    assert extend_job["error"] == "That key does not unlock this file."
+    assert second_response.status_code == 410
+    assert second_response.json()["detail"] == "This share link has already been used."
+    share_payload = _share_from_owner_list(owner_shares.json()["shares"], token)
+    assert share_payload["status"] == "used"
+    assert share_payload["download_count"] == 1
+    assert share_payload["downloads"][0]["ip_address"] == "203.0.113.10"
+
+
+def test_owner_can_list_and_revoke_shares(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 6, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        _, token = _create_share_and_wait(client, video_id)
+        artifact_dir = Path(server_app.DATA_DIR) / "share-artifacts" / token
+
+        list_response = client.get("/api/library/shares")
+        revoke_response = client.post(f"/api/library/shares/{token}/revoke")
+        download_response = client.get(f"/api/shares/{token}/download")
+
+    assert list_response.status_code == 200
+    listed_share = _share_from_owner_list(list_response.json()["shares"], token)
+    assert listed_share["status"] == "active"
+    assert listed_share["share_url"].endswith(f"/s/{token}")
+    assert revoke_response.status_code == 200
+    assert revoke_response.json()["share"]["status"] == "revoked"
+    assert download_response.status_code == 410
+    assert download_response.json()["detail"] == "This share link is no longer available."
+    assert artifact_dir.exists() is False
+
+
+def test_replacing_share_invalidates_previous_token(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 10, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+
+        first_job, first_share = _create_share_and_wait(client, video_id)
+        first_artifact_dir = Path(server_app.DATA_DIR) / "share-artifacts" / first_share
+        second_job, second_share = _create_share_and_wait(client, video_id)
+
+        old_response = client.get(f"/api/shares/{first_share}/download")
+        new_response = client.get(f"/api/shares/{second_share}/download")
+
+    assert first_share != second_share
+    assert first_job["status"] == "completed"
+    assert second_job["status"] == "completed"
+    assert old_response.status_code == 410
+    assert old_response.json()["detail"] == "This share link is no longer available."
+    assert new_response.status_code == 200
+    assert first_artifact_dir.exists() is False
+
+
+def test_share_failure_hides_private_youtube_details(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeBrokenDownloadYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 12, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        share_job, token = _create_share_and_wait(client, video_id)
+        page_response = client.get(f"/s/{token}")
+
+    assert share_job["status"] == "failed"
+    assert share_job["error"] == "Could not prepare this share."
+    assert "downstream failure" not in share_job["error"]
+    assert page_response.status_code == 410
+
+
+def test_share_page_renders_file_details(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 4, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        share_job, token = _create_share_and_wait(client, video_id)
+
+        response = client.get(f"/s/{token}")
+
+    assert share_job["status"] == "completed"
+    assert response.status_code == 200
+    assert "hello.txt" in response.text
+    assert "window.__SHARE_PAGE__" in response.text
+    assert f"/api/shares/{token}/download" in response.text
+
+
+def test_public_host_only_serves_share_routes(isolated_jobs_dir, monkeypatch) -> None:
+    fake_youtube = FakeYouTubeService()
+    monkeypatch.setattr(server_app, "youtube_service", fake_youtube)
+
+    with TestClient(server_app.app) as client:
+        client.post("/api/settings/app", json={"public_app_url": "https://files.example.com"})
+        upload_response = client.post(
+            "/api/files",
+            files={"file": ("hello.txt", b"hello from storagex\n" * 4, "text/plain")},
+            data={"key": VALID_KEY},
+        )
+        upload_job = _wait_for_completion(client, upload_response.json()["job_id"])
+        video_id = upload_job["metadata"]["remote_file"]["video_id"]
+        _, token = _create_share_and_wait(client, video_id)
+
+        blocked_response = client.get("/", headers={"host": "files.example.com"})
+        share_response = client.get(f"/s/{token}", headers={"host": "files.example.com"})
+
+    assert blocked_response.status_code == 404
+    assert blocked_response.text == "Not Found"
+    assert share_response.status_code == 200
+    assert "window.__SHARE_PAGE__" in share_response.text
 
 
 def _wait_for_completion(client: TestClient, job_id: str, timeout: float = 30.0) -> dict:
@@ -667,6 +1076,23 @@ def _wait_for_completion(client: TestClient, job_id: str, timeout: float = 30.0)
             return payload
         time.sleep(0.1)
     raise AssertionError(f"Job {job_id} did not finish in time.")
+
+
+def _create_share_and_wait(client: TestClient, video_id: str, *, key: str = VALID_KEY) -> tuple[dict, str]:
+    response = client.post(f"/api/library/files/{video_id}/share", json={"key": key})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "queued"
+    job = _wait_for_completion(client, payload["job_id"])
+    token = str(job["metadata"]["share_url"]).rsplit("/", 1)[-1]
+    return job, token
+
+
+def _share_from_owner_list(shares: list[dict], token: str) -> dict:
+    for share in shares:
+        if share.get("token") == token:
+            return share
+    raise AssertionError(f"Missing share {token}")
 
 
 def _build_legacy_webm_archive(root: Path, *, filename: str, payload: bytes) -> Path:

@@ -12,7 +12,7 @@ cd /path/to/storagex
 2. Open `http://127.0.0.1:8000`.
 3. Save a valid Google OAuth client ID and client secret in `Settings`.
 4. Connect the YouTube account.
-5. Upload one small `.txt` file.
+5. Upload one small file such as `.txt`, `.pptx`, or `.xlsx`.
 6. Confirm the file appears in the library.
 7. Create a folder, upload into it, then confirm the file appears in that folder.
 8. Double-click the file name, rename it inline, and confirm the new name stays visible.

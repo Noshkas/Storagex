@@ -17,11 +17,12 @@ cd /Users/noahjeske/Documents/storagex && uv run python scripts/benchmark_codec.
 | legacy | 1 | 11.566 | 1.065 | `.webm` | 1.96 | true |
 | legacy | 10 | 134.830 | 13.456 | `.webm` | 19.25 | true |
 | legacy | 100 | ~1348.298 | ~134.559 | `.webm` | ~192.53 | estimated |
-| current | 1 | 0.383 | 0.410 | `.mkv` | 4.24 | true |
-| current | 10 | 3.218 | 3.694 | `.mkv` | 42.41 | true |
-| current | 100 | 31.363 | 36.702 | `.mkv` | 424.04 | true |
+| current | 1 | 0.074 | 0.108 | `.mkv` | 1.07 | true |
+| current | 10 | 0.236 | 0.252 | `.mkv` | 10.64 | true |
+| current | 100 | 2.012 | 1.842 | `.mkv` | 106.35 | true |
 
 ## Notes
 
 - The `legacy` 100 MiB row is a linear estimate from the measured 10 MiB run. A direct full run was skipped because the old path is prohibitively slow at that size on this machine.
-- The new path trades archive size for speed. Local `.mkv` archives are materially larger than the old `.webm` output, but encode/decode latency drops by roughly an order of magnitude for the tested sizes.
+- The new default local path uses dense raw-byte frames inside lossless `.mkv`, so frame count is dramatically lower than the bit-grid path. The bit-grid layout is still used for YouTube-safe archives and opt-in debug PNG artifacts.
+- The local `.mkv` archive is now close to payload size instead of expanding it heavily, while still decoding much faster than the old `.webm` path.

@@ -14,6 +14,7 @@ import numpy as np
 
 from .constants import (
     APP_MAGIC,
+    BITGRID_FORMAT_VERSION,
     CELL_SIZE,
     FINDER_SIZE,
     FORMAT_VERSION,
@@ -33,6 +34,8 @@ from .keyed import KEY_LENGTH, LEGACY_KEY_MODE, STREAM_KEY_MODE
 FRAME_HEADER_STRUCT = struct.Struct("<4sIII")
 STREAM_HEADER_STRUCT = struct.Struct("<I")
 SAFE_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+BITGRID_FRAME_LAYOUT = "bitgrid-v1"
+DENSE_FRAME_LAYOUT = "dense-gray-raw-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +107,7 @@ def build_layout() -> FrameLayout:
 
 
 LAYOUT = build_layout()
+DENSE_CHUNK_BYTE_CAPACITY = (FRAME_WIDTH * FRAME_HEIGHT) - FRAME_HEADER_STRUCT.size
 
 
 def bytes_to_bits(data: bytes) -> np.ndarray:
@@ -151,7 +155,10 @@ def build_manifest_from_stats(
     sha256: str,
     crc32: str,
     version: int = FORMAT_VERSION,
+    frame_layout: str | None = None,
 ) -> dict[str, int | str | bool]:
+    resolved_frame_layout = frame_layout or default_frame_layout(version)
+    chunk_payload_bytes = frame_payload_capacity_for_layout(resolved_frame_layout)
     manifest: dict[str, int | str | bool] = {
         "magic": APP_MAGIC,
         "version": version,
@@ -167,19 +174,21 @@ def build_manifest_from_stats(
         "crc32": crc32,
         "frame_width": FRAME_WIDTH,
         "frame_height": FRAME_HEIGHT,
-        "cell_size": CELL_SIZE,
-        "quiet_margin": QUIET_MARGIN,
-        "grid_cols": GRID_COLS,
-        "grid_rows": GRID_ROWS,
+        "frame_layout": resolved_frame_layout,
         "fps": FPS,
-        "finder_size": FINDER_SIZE,
-        "timing_index": TIMING_INDEX,
-        "chunk_payload_bytes": LAYOUT.chunk_byte_capacity,
+        "chunk_payload_bytes": chunk_payload_bytes,
         "total_frames": total_frames,
     }
+    if resolved_frame_layout == BITGRID_FRAME_LAYOUT:
+        manifest["cell_size"] = CELL_SIZE
+        manifest["quiet_margin"] = QUIET_MARGIN
+        manifest["grid_cols"] = GRID_COLS
+        manifest["grid_rows"] = GRID_ROWS
+        manifest["finder_size"] = FINDER_SIZE
+        manifest["timing_index"] = TIMING_INDEX
     if version == LEGACY_FORMAT_VERSION:
         manifest["key_mode"] = LEGACY_KEY_MODE
-    elif version == FORMAT_VERSION:
+    elif version in {BITGRID_FORMAT_VERSION, FORMAT_VERSION}:
         manifest["key_mode"] = STREAM_KEY_MODE
         manifest["key_chunk_bytes"] = KEY_CHUNK_BYTES
     else:
@@ -194,7 +203,8 @@ def build_manifest(
     original_bytes: bytes,
     stored_bytes: bytes,
     total_frames: int,
-    version: int = FORMAT_VERSION,
+    version: int = BITGRID_FORMAT_VERSION,
+    frame_layout: str | None = None,
 ) -> dict[str, int | str | bool]:
     return build_manifest_from_stats(
         original_filename=original_filename,
@@ -205,6 +215,7 @@ def build_manifest(
         sha256=hashlib.sha256(original_bytes).hexdigest(),
         crc32=f"{zlib.crc32(original_bytes) & 0xFFFFFFFF:08x}",
         version=version,
+        frame_layout=frame_layout,
     )
 
 
@@ -244,13 +255,25 @@ def total_stream_size(*, manifest: dict[str, object], stored_size: int) -> int:
     return stream_prefix_length(manifest) + stored_size
 
 
-def chunk_stream(stream_bytes: bytes) -> list[bytes]:
+def default_frame_layout(version: int) -> str:
+    if version == FORMAT_VERSION:
+        return DENSE_FRAME_LAYOUT
+    return BITGRID_FRAME_LAYOUT
+
+
+def frame_payload_capacity_for_layout(frame_layout: str) -> int:
+    if frame_layout == DENSE_FRAME_LAYOUT:
+        return DENSE_CHUNK_BYTE_CAPACITY
+    return LAYOUT.chunk_byte_capacity
+
+
+def chunk_stream(stream_bytes: bytes, *, chunk_payload_bytes: int = LAYOUT.chunk_byte_capacity) -> list[bytes]:
     if not stream_bytes:
         return [b""]
 
     return [
-        stream_bytes[offset : offset + LAYOUT.chunk_byte_capacity]
-        for offset in range(0, len(stream_bytes), LAYOUT.chunk_byte_capacity)
+        stream_bytes[offset : offset + chunk_payload_bytes]
+        for offset in range(0, len(stream_bytes), chunk_payload_bytes)
     ]
 
 
@@ -263,6 +286,7 @@ def build_manifest_for_payload(
     sha256: str,
     crc32: str,
     version: int = FORMAT_VERSION,
+    frame_layout: str | None = None,
 ) -> dict[str, object]:
     total_frames = 0
 
@@ -276,8 +300,10 @@ def build_manifest_for_payload(
             sha256=sha256,
             crc32=crc32,
             version=version,
+            frame_layout=frame_layout,
         )
-        required_frames = max(1, math.ceil(total_stream_size(manifest=manifest, stored_size=stored_size) / LAYOUT.chunk_byte_capacity))
+        chunk_payload_bytes = int(manifest["chunk_payload_bytes"])
+        required_frames = max(1, math.ceil(total_stream_size(manifest=manifest, stored_size=stored_size) / chunk_payload_bytes))
         if required_frames == total_frames:
             return manifest
         total_frames = required_frames
@@ -289,7 +315,8 @@ def build_stream_with_manifest(
     media_type: str,
     original_bytes: bytes,
     stored_bytes: bytes,
-    version: int = FORMAT_VERSION,
+    version: int = BITGRID_FORMAT_VERSION,
+    frame_layout: str | None = None,
 ) -> tuple[dict[str, object], bytes, list[bytes]]:
     manifest = build_manifest_for_payload(
         original_filename=original_filename,
@@ -299,9 +326,10 @@ def build_stream_with_manifest(
         sha256=hashlib.sha256(original_bytes).hexdigest(),
         crc32=f"{zlib.crc32(original_bytes) & 0xFFFFFFFF:08x}",
         version=version,
+        frame_layout=frame_layout,
     )
     stream_bytes = assemble_stream(manifest, stored_bytes)
-    return manifest, stream_bytes, chunk_stream(stream_bytes)
+    return manifest, stream_bytes, chunk_stream(stream_bytes, chunk_payload_bytes=int(manifest["chunk_payload_bytes"]))
 
 
 def validate_manifest(manifest: dict[str, object]) -> None:
@@ -309,7 +337,7 @@ def validate_manifest(manifest: dict[str, object]) -> None:
         raise ValueError("Video is not an app-generated bit video.")
 
     version = manifest.get("version")
-    if version not in {LEGACY_FORMAT_VERSION, FORMAT_VERSION}:
+    if version not in {LEGACY_FORMAT_VERSION, BITGRID_FORMAT_VERSION, FORMAT_VERSION}:
         raise ValueError("Unsupported bit video version.")
     if manifest.get("keyed") is not True:
         raise ValueError("Video is not using the keyed format.")
@@ -321,16 +349,26 @@ def validate_manifest(manifest: dict[str, object]) -> None:
         raise ValueError("Unexpected compression mode in manifest.")
     if manifest.get("frame_width") != FRAME_WIDTH or manifest.get("frame_height") != FRAME_HEIGHT:
         raise ValueError("Unexpected frame dimensions in manifest.")
-    if manifest.get("cell_size") != CELL_SIZE or manifest.get("quiet_margin") != QUIET_MARGIN:
-        raise ValueError("Unexpected frame geometry in manifest.")
-    if manifest.get("grid_cols") != GRID_COLS or manifest.get("grid_rows") != GRID_ROWS:
-        raise ValueError("Unexpected grid geometry in manifest.")
-    if manifest.get("finder_size") != FINDER_SIZE or manifest.get("timing_index") != TIMING_INDEX:
-        raise ValueError("Unexpected finder pattern geometry in manifest.")
-    if manifest.get("chunk_payload_bytes") != LAYOUT.chunk_byte_capacity:
-        raise ValueError("Unexpected payload chunk capacity in manifest.")
     if manifest.get("fps") != FPS:
         raise ValueError("Unexpected frame rate in manifest.")
+
+    frame_layout = manifest.get("frame_layout")
+    if version in {LEGACY_FORMAT_VERSION, BITGRID_FORMAT_VERSION}:
+        if frame_layout not in {None, BITGRID_FRAME_LAYOUT}:
+            raise ValueError("Unexpected frame layout in manifest.")
+        if manifest.get("cell_size") != CELL_SIZE or manifest.get("quiet_margin") != QUIET_MARGIN:
+            raise ValueError("Unexpected frame geometry in manifest.")
+        if manifest.get("grid_cols") != GRID_COLS or manifest.get("grid_rows") != GRID_ROWS:
+            raise ValueError("Unexpected grid geometry in manifest.")
+        if manifest.get("finder_size") != FINDER_SIZE or manifest.get("timing_index") != TIMING_INDEX:
+            raise ValueError("Unexpected finder pattern geometry in manifest.")
+        if manifest.get("chunk_payload_bytes") != LAYOUT.chunk_byte_capacity:
+            raise ValueError("Unexpected payload chunk capacity in manifest.")
+    else:
+        if frame_layout != DENSE_FRAME_LAYOUT:
+            raise ValueError("Unexpected frame layout in manifest.")
+        if manifest.get("chunk_payload_bytes") != DENSE_CHUNK_BYTE_CAPACITY:
+            raise ValueError("Unexpected payload chunk capacity in manifest.")
 
     if version == LEGACY_FORMAT_VERSION:
         if manifest.get("key_mode") != LEGACY_KEY_MODE:

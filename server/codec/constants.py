@@ -1,7 +1,9 @@
+import tempfile
 from pathlib import Path
 
 APP_MAGIC = "storagex-bit-video"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
+BITGRID_FORMAT_VERSION = 3
 LEGACY_FORMAT_VERSION = 2
 FRAME_MAGIC = b"BVF1"
 
@@ -19,7 +21,6 @@ TIMING_INDEX = 8
 
 KEY_CHUNK_BYTES = 1024 * 1024
 MAX_DECODE_UPLOAD_SIZE = 1024 * 1024 * 1024
-JOB_TTL_SECONDS = 24 * 60 * 60
 
 FRAME_PATTERN = "frame_%06d.png"
 VIDEO_NAME = "output/video.mkv"
@@ -29,6 +30,6 @@ FRAMES_ARCHIVE_NAME = "output/frames.zip"
 RECOVERED_MANIFEST_NAME = "output/recovered_manifest.json"
 
 DATA_DIR = Path("data")
-JOBS_DIR = DATA_DIR / "jobs"
+JOBS_DIR = Path(tempfile.gettempdir()) / "storagex" / "jobs"
 
 ALLOWED_DECODE_EXTENSIONS = {".webm", ".mkv"}

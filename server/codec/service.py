@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 from .constants import (
+    BITGRID_FORMAT_VERSION,
     CELL_SIZE,
     FORMAT_VERSION,
     FPS,
@@ -32,6 +33,9 @@ from .constants import (
     YOUTUBE_VIDEO_NAME,
 )
 from .format import (
+    BITGRID_FRAME_LAYOUT,
+    DENSE_FRAME_LAYOUT,
+    DENSE_CHUNK_BYTE_CAPACITY,
     FRAME_HEADER_STRUCT,
     FRAME_MAGIC,
     LAYOUT,
@@ -41,6 +45,7 @@ from .format import (
     build_manifest_for_payload,
     build_stream_with_manifest,
     bytes_to_bits,
+    frame_payload_capacity_for_layout,
     parse_stream,
     sanitize_filename,
     validate_manifest,
@@ -116,16 +121,25 @@ def encode_file(
     progress: ProgressCallback | None = None,
     debug_artifacts: bool = False,
 ) -> EncodeResult:
-    return _encode_source(
+    if debug_artifacts:
+        return _encode_bitgrid_source(
+            source_path=source_path,
+            original_filename=original_filename,
+            media_type=media_type,
+            key=key,
+            job_dir=job_dir,
+            output_path=job_dir / VIDEO_NAME,
+            target="local",
+            progress=progress,
+            debug_artifacts=True,
+        )
+    return _encode_dense_local_source(
         source_path=source_path,
         original_filename=original_filename,
         media_type=media_type,
         key=key,
         job_dir=job_dir,
-        output_path=job_dir / VIDEO_NAME,
-        target="local",
         progress=progress,
-        debug_artifacts=debug_artifacts,
     )
 
 
@@ -138,7 +152,7 @@ def encode_file_for_youtube_upload(
     job_dir: Path,
     progress: ProgressCallback | None = None,
 ) -> EncodeResult:
-    return _encode_source(
+    return _encode_bitgrid_source(
         source_path=source_path,
         original_filename=original_filename,
         media_type=media_type,
@@ -174,16 +188,17 @@ def decode_video(
     expected_frame_index = 0
     previous_frame_index: int | None = None
     previous_chunk: bytes | None = None
+    frame_parser: Callable[[bytes], tuple[int, bytes]] | None = None
 
     update(2, "Inspecting uploaded archive.")
 
     def handle_frame(frame_bytes: bytes, extracted_frames: int) -> None:
         del extracted_frames
-        nonlocal expected_frame_index, previous_frame_index, previous_chunk, manifest, protected_handle
+        nonlocal expected_frame_index, previous_frame_index, previous_chunk, manifest, protected_handle, frame_parser
 
-        grid = _grid_from_frame_pixels(_frame_array_from_bytes(frame_bytes))
-        _validate_reserved_cells(grid)
-        frame_index, chunk = _parse_frame_grid(grid)
+        if frame_parser is None:
+            frame_parser = _parse_dense_frame_bytes if frame_bytes.startswith(FRAME_MAGIC) else _parse_bitgrid_frame_bytes
+        frame_index, chunk = frame_parser(frame_bytes)
 
         if frame_index == expected_frame_index:
             expected_frame_index += 1
@@ -358,7 +373,71 @@ def decode_video_from_frames(
     )
 
 
-def _encode_source(
+def _encode_dense_local_source(
+    *,
+    source_path: Path,
+    original_filename: str,
+    media_type: str,
+    key: str,
+    job_dir: Path,
+    progress: ProgressCallback | None,
+) -> EncodeResult:
+    update = progress or _noop_progress
+    try:
+        normalized_key = validate_numeric_key(key)
+    except ValueError as exc:
+        raise CodecError(str(exc)) from exc
+
+    stats = _scan_source_file(source_path)
+    manifest = build_manifest_for_payload(
+        original_filename=original_filename,
+        media_type=media_type,
+        original_size=stats["size"],
+        stored_size=stats["size"],
+        sha256=stats["sha256"],
+        crc32=stats["crc32"],
+        version=FORMAT_VERSION,
+        frame_layout=DENSE_FRAME_LAYOUT,
+    )
+
+    output_dir = job_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = job_dir / VIDEO_NAME
+    manifest_path = job_dir / MANIFEST_NAME
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    update(10, "Prepared dense local archive manifest.")
+
+    total_frames = int(manifest["total_frames"])
+
+    def frame_source():
+        generated_frames = 0
+        for generated_frames, frame_bytes in enumerate(
+            _iter_dense_frame_bytes(source_path=source_path, key=normalized_key, manifest=manifest),
+            start=1,
+        ):
+            frame_progress = 12 + math.floor((generated_frames / total_frames) * 86)
+            update(frame_progress, f"Encoded dense frame {generated_frames} of {total_frames}.")
+            yield frame_bytes
+
+        if generated_frames != total_frames:
+            raise CodecError("Frame count does not match the encoded manifest.")
+
+    try:
+        encode_raw_frames_to_mkv(frame_source(), output_path, fps=int(manifest["fps"]))
+    except RuntimeError as exc:
+        raise CodecError(str(exc)) from exc
+
+    update(100, "Encoded dense local archive video.")
+    return EncodeResult(
+        manifest=manifest,
+        video_path=output_path,
+        frames_zip_path=None,
+        manifest_path=manifest_path,
+        frame_paths=[],
+    )
+
+
+def _encode_bitgrid_source(
     *,
     source_path: Path,
     original_filename: str,
@@ -384,7 +463,8 @@ def _encode_source(
         stored_size=stats["size"],
         sha256=stats["sha256"],
         crc32=stats["crc32"],
-        version=FORMAT_VERSION,
+        version=BITGRID_FORMAT_VERSION,
+        frame_layout=BITGRID_FRAME_LAYOUT,
     )
 
     output_dir = job_dir / "output"
@@ -468,7 +548,7 @@ def _scan_source_file(source_path: Path) -> dict[str, str | int]:
 
 def _iter_frame_chunks(*, source_path: Path, key: str, manifest: dict[str, object]):
     buffer = bytearray(assemble_stream_prefix(manifest))
-    chunk_capacity = LAYOUT.chunk_byte_capacity
+    chunk_capacity = int(manifest["chunk_payload_bytes"])
     key_chunk_bytes = int(manifest.get("key_chunk_bytes", KEY_CHUNK_BYTES))
 
     with source_path.open("rb") as source:
@@ -480,6 +560,11 @@ def _iter_frame_chunks(*, source_path: Path, key: str, manifest: dict[str, objec
 
     if buffer:
         yield bytes(buffer)
+
+
+def _iter_dense_frame_bytes(*, source_path: Path, key: str, manifest: dict[str, object]):
+    for frame_index, chunk in enumerate(_iter_frame_chunks(source_path=source_path, key=key, manifest=manifest)):
+        yield _render_dense_frame_bytes(frame_index=frame_index, chunk=chunk)
 
 
 def _restore_payload_file(
@@ -590,6 +675,17 @@ def _render_frame_grid(*, frame_index: int, chunk: bytes) -> np.ndarray:
     return grid
 
 
+def _render_dense_frame_bytes(*, frame_index: int, chunk: bytes) -> bytes:
+    if len(chunk) > DENSE_CHUNK_BYTE_CAPACITY:
+        raise CodecError("Chunk exceeds dense frame payload capacity.")
+
+    frame = bytearray(FRAME_WIDTH * FRAME_HEIGHT)
+    header = FRAME_HEADER_STRUCT.pack(FRAME_MAGIC, frame_index, len(chunk), zlib.crc32(chunk) & 0xFFFFFFFF)
+    frame[: FRAME_HEADER_STRUCT.size] = header
+    frame[FRAME_HEADER_STRUCT.size : FRAME_HEADER_STRUCT.size + len(chunk)] = chunk
+    return bytes(frame)
+
+
 def _render_frame_pixels(*, frame_index: int, chunk: bytes) -> np.ndarray:
     if len(chunk) > LAYOUT.chunk_byte_capacity:
         raise CodecError("Chunk exceeds frame payload capacity.")
@@ -671,6 +767,31 @@ def _parse_frame_grid(grid: np.ndarray) -> tuple[int, bytes]:
     if zlib.crc32(chunk) & 0xFFFFFFFF != chunk_crc:
         raise CodecError(f"Frame {frame_index} failed CRC validation.")
     return frame_index, chunk
+
+
+def _parse_dense_frame_bytes(frame_bytes: bytes) -> tuple[int, bytes]:
+    if len(frame_bytes) != FRAME_HEIGHT * FRAME_WIDTH:
+        raise CodecError("Decoded frame dimensions do not match the expected geometry.")
+
+    header_size = FRAME_HEADER_STRUCT.size
+    header = frame_bytes[:header_size]
+    magic, frame_index, chunk_length, chunk_crc = FRAME_HEADER_STRUCT.unpack(header)
+    if magic != FRAME_MAGIC:
+        raise CodecError("Frame header magic did not match the app format.")
+    if chunk_length > DENSE_CHUNK_BYTE_CAPACITY:
+        raise CodecError("Frame chunk length exceeds the payload capacity.")
+
+    chunk_end = header_size + chunk_length
+    chunk = frame_bytes[header_size:chunk_end]
+    if zlib.crc32(chunk) & 0xFFFFFFFF != chunk_crc:
+        raise CodecError(f"Frame {frame_index} failed CRC validation.")
+    return frame_index, chunk
+
+
+def _parse_bitgrid_frame_bytes(frame_bytes: bytes) -> tuple[int, bytes]:
+    grid = _grid_from_frame_pixels(_frame_array_from_bytes(frame_bytes))
+    _validate_reserved_cells(grid)
+    return _parse_frame_grid(grid)
 
 
 def _noop_progress(_progress: int, _message: str) -> None:

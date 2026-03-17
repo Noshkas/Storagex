@@ -12,6 +12,7 @@ from PIL import Image
 
 from server.codec.constants import CELL_SIZE, FORMAT_VERSION, KEY_CHUNK_BYTES, LEGACY_FORMAT_VERSION, QUIET_MARGIN
 from server.codec.format import (
+    DENSE_CHUNK_BYTE_CAPACITY,
     LAYOUT,
     assemble_stream,
     bits_to_bytes,
@@ -102,10 +103,13 @@ def test_manifest_total_frames_is_stable() -> None:
         media_type="text/plain",
         original_bytes=payload,
         stored_bytes=b"".join(stream_payload_transform(BytesIO(payload), key=VALID_KEY)),
+        version=FORMAT_VERSION,
     )
     assert manifest["version"] == FORMAT_VERSION
     assert manifest["key_mode"] == STREAM_KEY_MODE
     assert manifest["key_chunk_bytes"] == KEY_CHUNK_BYTES
+    assert manifest["chunk_payload_bytes"] == DENSE_CHUNK_BYTE_CAPACITY
+    assert manifest["chunk_payload_bytes"] > LAYOUT.chunk_byte_capacity
     assert manifest["total_frames"] == len(chunks)
     assert manifest["compressed"] is False
     assert manifest["keyed"] is True
